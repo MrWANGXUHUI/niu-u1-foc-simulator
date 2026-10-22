@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 740" width="1160" height="740">
+  <defs>
+    <linearGradient id="boardFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F8FBFF"/>
+      <stop offset="1" stop-color="#E6EFFF"/>
+    </linearGradient>
+    <linearGradient id="busFill" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FBEAF3"/>
+      <stop offset="1" stop-color="#FDF2F8"/>
+    </linearGradient>
+  </defs>
+
+  <text x="580" y="44" font-family="Noto Sans SC, sans-serif" font-size="26" font-weight="bold" fill="#0F172A" text-anchor="middle">ESP32-C3（天问 Pro TW002）引脚接线拓扑</text>
+  <text x="580" y="72" font-family="Noto Sans SC, sans-serif" font-size="14" fill="#64748B" text-anchor="middle">对照固件宏定义 · Serial1 = GPIO4(RX) / GPIO7(TX) @ 9600 8E1 · 板载 OLED 独占 GPIO5/6</text>
+
+  <!-- 霍尔传感器 -->
+  <rect x="60" y="170" width="250" height="138" rx="14" fill="#FFF7EA" stroke="#F59E0B" stroke-width="2"/>
+  <rect x="60" y="170" width="250" height="30" rx="14" fill="#F59E0B"/>
+  <rect x="60" y="188" width="250" height="12" fill="#F59E0B"/>
+  <text x="185" y="191" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="bold" fill="#7C2D12" text-anchor="middle">霍尔轮速传感器</text>
+  <text x="78" y="224" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#78350F">A3144 / SSR14Y（开集电极）</text>
+  <text x="78" y="246" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#78350F">VCC → 3.3V　　GND → GND</text>
+  <text x="78" y="268" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#B45309" font-weight="bold">OUT → GPIO3</text>
+  <text x="78" y="292" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#78350F">1 磁钢 · 16x2.50/64-305 · 周长 1.28m</text>
+
+  <!-- 电源轨 -->
+  <rect x="60" y="330" width="250" height="196" rx="14" fill="#F6F8FB" stroke="#94A3B8" stroke-width="2"/>
+  <rect x="60" y="330" width="250" height="30" rx="14" fill="#475569"/>
+  <rect x="60" y="348" width="250" height="12" fill="#475569"/>
+  <text x="185" y="351" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="bold" fill="#F8FAFC" text-anchor="middle">电源与公共端</text>
+  <text x="78" y="386" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#334155">48V 铅酸电池 → XL7015 降压</text>
+  <text x="78" y="410" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#334155">5V → 板载 LDO → 3.3V</text>
+  <text x="78" y="434" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#334155">3.3V → OLED / MAX485 / 霍尔</text>
+  <text x="78" y="458" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#334155">GND 全模块单点共地</text>
+  <text x="78" y="486" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#B91C1C" font-weight="bold">GPIO9 = BOOT 键，别占</text>
+  <text x="78" y="510" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#B91C1C" font-weight="bold">GPIO20/21 = 系统保留，别碰</text>
+
+  <!-- ESP32-C3 主板 -->
+  <rect x="430" y="110" width="300" height="430" rx="18" fill="url(#boardFill)" stroke="#4C7DF0" stroke-width="2.5"/>
+  <text x="580" y="144" font-family="Noto Sans SC, sans-serif" font-size="17" font-weight="bold" fill="#1E3A8A" text-anchor="middle">ESP32-C3-DevKitC-02</text>
+  <text x="580" y="166" font-family="Noto Sans SC, sans-serif" font-size="12" fill="#475569" text-anchor="middle">天问 Pro TW002 · 4MB Flash · CH340K</text>
+
+  <!-- 引脚芯片 -->
+  <rect x="455" y="185" width="250" height="42" rx="10" fill="#FFF7EA" stroke="#F59E0B" stroke-width="1.5"/>
+  <rect x="455" y="185" width="5" height="42" rx="2.5" fill="#F59E0B"/>
+  <text x="472" y="211" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="bold" fill="#B45309">GPIO3</text>
+  <text x="530" y="210" font-family="Noto Sans SC, sans-serif" font-size="11.5" fill="#92400E">霍尔输入 · 上拉 + 下降沿中断</text>
+
+  <rect x="455" y="237" width="250" height="42" rx="10" fill="#EEFAF2" stroke="#22C55E" stroke-width="1.5"/>
+  <rect x="455" y="237" width="5" height="42" rx="2.5" fill="#22C55E"/>
+  <text x="472" y="263" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="bold" fill="#15803D">GPIO5</text>
+  <text x="530" y="262" font-family="Noto Sans SC, sans-serif" font-size="11.5" fill="#166534">I2C SDA · 板载 OLED</text>
+
+  <rect x="455" y="289" width="250" height="42" rx="10" fill="#EEFAF2" stroke="#22C55E" stroke-width="1.5"/>
+  <rect x="455" y="289" width="5" height="42" rx="2.5" fill="#22C55E"/>
+  <text x="472" y="315" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="bold" fill="#15803D">GPIO6</text>
+  <text x="530" y="314" font-family="Noto Sans SC, sans-serif" font-size="11.5" fill="#166534">I2C SCL · 板载 OLED</text>
+
+  <rect x="455" y="341" width="250" height="42" rx="10" fill="#FDF0F7" stroke="#EC4899" stroke-width="1.5"/>
+  <rect x="455" y="341" width="5" height="42" rx="2.5" fill="#EC4899"/>
+  <text x="472" y="367" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="bold" fill="#BE185D">GPIO4</text>
+  <text x="530" y="366" font-family="Noto Sans SC, sans-serif" font-size="11.5" fill="#9D174D">485 RX ← MAX485 RO</text>
+
+  <rect x="455" y="393" width="250" height="42" rx="10" fill="#FDF0F7" stroke="#EC4899" stroke-width="1.5"/>
+  <rect x="455" y="393" width="5" height="42" rx="2.5" fill="#EC4899"/>
+  <text x="472" y="419" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="bold" fill="#BE185D">GPIO7</text>
+  <text x="530" y="418" font-family="Noto Sans SC, sans-serif" font-size="11.5" fill="#9D174D">485 TX → MAX485 DI</text>
+
+  <rect x="455" y="445" width="250" height="42" rx="10" fill="#FEFCF0" stroke="#EAB308" stroke-width="1.5"/>
+  <rect x="455" y="445" width="5" height="42" rx="2.5" fill="#EAB308"/>
+  <text x="472" y="471" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="bold" fill="#A16207">GPIO8</text>
+  <text x="530" y="470" font-family="Noto Sans SC, sans-serif" font-size="11.5" fill="#854D0E">板载 LED · 500ms 翻转</text>
+
+  <!-- I2C 模块 -->
+  <rect x="800" y="200" width="280" height="140" rx="14" fill="#EEFAF2" stroke="#22C55E" stroke-width="2"/>
+  <rect x="800" y="200" width="280" height="30" rx="14" fill="#22C55E"/>
+  <rect x="800" y="218" width="280" height="12" fill="#22C55E"/>
+  <text x="940" y="221" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="bold" fill="#F0FDF4" text-anchor="middle">I2C 总线 · 100kHz</text>
+  <text x="818" y="254" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#166534">板载 OLED SSD1306 128×64（0x3C）</text>
+  <text x="818" y="278" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#166534">I2C 总线仅此一个器件（0x3C，备选 0x3D）</text>
+  <text x="818" y="302" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#166534">SDA = GPIO5　　SCL = GPIO6</text>
+  <text x="818" y="326" font-family="Noto Sans SC, sans-serif" font-size="11.5" fill="#15803D">Wire.begin(5, 6) 必须最先初始化</text>
+
+  <!-- MAX485 模块 -->
+  <rect x="800" y="360" width="280" height="160" rx="14" fill="url(#busFill)" stroke="#EC4899" stroke-width="2"/>
+  <rect x="800" y="360" width="280" height="30" rx="14" fill="#EC4899"/>
+  <rect x="800" y="378" width="280" height="12" fill="#EC4899"/>
+  <text x="940" y="381" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="bold" fill="#FDF2F8" text-anchor="middle">MAX485 自动收发型模块</text>
+  <text x="818" y="414" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#9D174D">RO ← GPIO4（RX，收 V35 报文）</text>
+  <text x="818" y="438" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#9D174D">DI ← GPIO7（TX，发应答帧）</text>
+  <text x="818" y="462" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#9D174D">DE / RE 板内自动，无需 GPIO 控制</text>
+  <text x="818" y="486" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#9D174D">9600 bps · 8E1（不是 115200 8N1）</text>
+  <text x="818" y="508" font-family="Noto Sans SC, sans-serif" font-size="11.5" fill="#BE185D">A/B 接原车 485 差分线，不可反</text>
+
+  <!-- V35 ECU -->
+  <rect x="800" y="570" width="280" height="130" rx="14" fill="#F5F0FF" stroke="#7E22CE" stroke-width="2"/>
+  <rect x="800" y="570" width="280" height="30" rx="14" fill="#7E22CE"/>
+  <rect x="800" y="588" width="280" height="12" fill="#7E22CE"/>
+  <text x="940" y="591" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="bold" fill="#FAF5FF" text-anchor="middle">小牛 U1 V35 中控 ECU（0x40）</text>
+  <text x="818" y="624" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#5B21B6">485 主节点，所有轮询从这里发起</text>
+  <text x="818" y="648" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#5B21B6">仪表 0x10 / BMS 0x31 由它轮询</text>
+  <text x="818" y="672" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#5B21B6">FOC 0x20 = 本模拟器（只应答它）</text>
+
+  <!-- 调试通道 -->
+  <rect x="430" y="570" width="300" height="100" rx="14" fill="#F1F5F9" stroke="#64748B" stroke-width="2"/>
+  <text x="580" y="600" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="bold" fill="#1E293B" text-anchor="middle">USB CDC 调试通道（与 485 完全隔离）</text>
+  <text x="580" y="626" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#334155" text-anchor="middle">内部 GPIO18/19 → CH340K → /dev/ttyUSB0</text>
+  <text x="580" y="650" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#334155" text-anchor="middle">115200 8N1，仅 ASCII 日志，不污染总线</text>
+
+  <!-- 连线：霍尔 → GPIO3 -->
+  <polyline points="310,225 395,225 395,206 455,206" fill="none" stroke="#F59E0B" stroke-width="2.5"/>
+  <polygon points="455,206 444,200 444,212" fill="#F59E0B"/>
+
+  <!-- 连线：GPIO5/6 → I2C -->
+  <polyline points="705,258 800,258" fill="none" stroke="#22C55E" stroke-width="2.5"/>
+  <polygon points="800,258 789,252 789,264" fill="#22C55E"/>
+  <polyline points="705,310 800,310" fill="none" stroke="#22C55E" stroke-width="2.5"/>
+  <polygon points="800,310 789,304 789,316" fill="#22C55E"/>
+
+  <!-- 连线：GPIO4 → MAX485 RO -->
+  <polyline points="705,362 760,362 760,400 800,400" fill="none" stroke="#EC4899" stroke-width="2.5"/>
+  <polygon points="800,400 789,394 789,406" fill="#EC4899"/>
+  <!-- 连线：GPIO7 → MAX485 DI -->
+  <polyline points="705,414 735,414 735,438 800,438" fill="none" stroke="#EC4899" stroke-width="2.5"/>
+  <polygon points="800,438 789,432 789,444" fill="#EC4899"/>
+
+  <!-- 连线：MAX485 → V35 ECU -->
+  <polyline points="940,520 940,570" fill="none" stroke="#7E22CE" stroke-width="2.5" stroke-dasharray="7 5"/>
+  <polygon points="940,570 934,559 946,559" fill="#7E22CE"/>
+  <text x="952" y="550" font-family="Noto Sans SC, sans-serif" font-size="12" fill="#6D28D9">A / B 485 总线</text>
+
+  <!-- 底部说明 -->
+  <text x="580" y="712" font-family="Noto Sans SC, sans-serif" font-size="12.5" fill="#64748B" text-anchor="middle">ESP32-C3 上完全安全的 GPIO 只有 3 / 4 / 5 / 6 / 7 / 10，本项目 5 个外设引脚全部落在安全区</text>
+</svg>
