@@ -122,8 +122,8 @@ volatile uint32_t prev_pulse_us = 0;    // 上一个脉冲的时刻 (两者之�
 //        g_mileage += foc_speed * 12 * dt_ms * 10 / 36 / 25;
 //   2) 抓包统计: FOC 车速字节最大到 44, 仪表字节正好是它 *12/25 (±1)
 // 所以协议值 = round(kmh * 25 / 12), 取值 0..127 (int8, 负数 = 倒挂)
-uint16_t calcFOCSpeedFromKMH(uint16_t kmh) {
-    uint32_t v = ((uint32_t)kmh * 25 + 6) / 12;   // +6 = 四舍五入
+uint16_t calcFOCSpeedFromKMH(float kmh) {
+    uint32_t v = (uint32_t)(kmh * 25.0f / 12.0f + 0.5f);   // 四舍五入
     if (v > 127) v = 127;
     return (uint16_t)v;
 }
@@ -165,7 +165,7 @@ void updateWheelSpeed() {
 
     foc_status.wheel_rpm = (uint16_t)rpm;
     foc_status.wheel_speed_dm = (uint16_t)(kmh * 10.0f);
-    foc_status.foc_speed = calcFOCSpeedFromKMH((uint16_t)kmh);
+    foc_status.foc_speed = calcFOCSpeedFromKMH(kmh);
 }
 
 void IRAM_ATTR wheelPulseISR() {
@@ -431,7 +431,7 @@ void setup() {
 #else
     Serial.printf("[FOC] 轮速写死模式: %.1f km/h (协议值发 %d) — 装好磁钢后把 USE_HALL_SPEED 改 1\n",
         HARDCODE_SPEED_DM / 10.0,
-        calcFOCSpeedFromKMH((uint16_t)(HARDCODE_SPEED_DM / 10)));
+        calcFOCSpeedFromKMH(HARDCODE_SPEED_DM / 10.0f));
     Serial.flush();
 #endif
 
