@@ -24,12 +24,16 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_MIRROR, /* reset=*/ U8X8_PIN_NONE)
 #define WHEEL_CIRCUMFERENCE_M 1.28
 
 // ============ 轮速来源开关 ============
-// 0 = 写死车速 (霍尔还没装好, 用固定值喂给 V35 ECU 调试通信链路)
-// 1 = 霍尔实测 (磁钢盘装好后改成 1)
-#define USE_HALL_SPEED    0
+// 0 = 写死车速 (用固定值喂给 V35 ECU 调试通信链路)
+// 1 = 霍尔实测 (装好磁钢后走这条路)
+#define USE_HALL_SPEED    1
 // 写死的车速, 单位 km/h × 10 (170 = 17.0 km/h)
-// 17 km/h 超出协议对照表范围, 对应协议值 31 (封顶), 仪表显示约 17 km/h
+// 仅在 USE_HALL_SPEED = 0 时生效; 17 km/h 对应协议值 35, 仪表显示约 16.8 km/h
 #define HARDCODE_SPEED_DM 170
+
+// 霍尔测速参数
+#define HALL_DEBOUNCE_US      1000      // ISR 消抖: 1ms, 远小于最慢的真实脉冲间隔
+#define HALL_STOP_TIMEOUT_US  2000000   // 2s 没有新脉冲 → 认为停转, 车速归 0
 
 // ============ 联调测试开关 ============
 // 485 每秒主动发一帧测试数据, 用来确认 ESP32 确实在往总线上发.
@@ -104,46 +108,59 @@ static FOCStatus foc_status = {
 };
 
 // ============ 轮速测量 ============
+// 单磁钢 + 计数窗口测不出速度: 17km/h 时 250ms 窗口只期望 0.9 个脉冲, 读数会在
+// 0 和 ~24km/h 之间乱跳. 所以改用"脉冲间隔"测速 —— 相邻两个脉冲之间正好转了
+// MAGNET_COUNT 圈, 17km/h 时间隔 270ms, 分辨率 0.4%.
 volatile uint32_t wheel_pulse_count = 0;
-volatile uint32_t last_pulse_us = 0;
+volatile uint32_t last_pulse_us = 0;    // 最近一个脉冲的时刻
+volatile uint32_t prev_pulse_us = 0;    // 上一个脉冲的时刻 (两者之差 = 一圈时间)
 
-// 协议速度值 (0-31) 分档映射 — 抓包反推出来的非线性表, 不能用线性换算
-// 输入: 实际车速 (整数 km/h), 输出: 协议值
-//   0→0  1→3  2→5  3→7  4→10  5/6→13  7/8→17  9/10→21  11/12→25  13/14→30  15+→31
+// 协议速度值 — 线性刻度, 1 格 = 12/25 = 0.48 km/h
+// 依据:
+//   1) 实车跑通的 ECU 实现 github.com/xzfn/scooter-repair niu-ecu/User/niu_series_u.c
+//        dash_request.speed = foc_speed * 12 / 25;
+//        g_mileage += foc_speed * 12 * dt_ms * 10 / 36 / 25;
+//   2) 抓包统计: FOC 车速字节最大到 44, 仪表字节正好是它 *12/25 (±1)
+// 所以协议值 = round(kmh * 25 / 12), 取值 0..127 (int8, 负数 = 倒挂)
 uint16_t calcFOCSpeedFromKMH(uint16_t kmh) {
-    if (kmh <= 0) return 0;
-    if (kmh <= 1) return 3;
-    if (kmh <= 2) return 5;
-    if (kmh <= 3) return 7;
-    if (kmh <= 4) return 10;
-    if (kmh <= 6) return 13;
-    if (kmh <= 8) return 17;
-    if (kmh <= 10) return 21;
-    if (kmh <= 12) return 25;
-    if (kmh <= 14) return 30;
-    return 31;
+    uint32_t v = ((uint32_t)kmh * 25 + 6) / 12;   // +6 = 四舍五入
+    if (v > 127) v = 127;
+    return (uint16_t)v;
 }
 
 // 轮速更新由 loop 周期驱动 (不是只在收到查询时), OLED 才能显示实时速度
 static unsigned long lastSpeedCalc = 0;
-static uint32_t lastPulseSnapshot = 0;
+static uint32_t last_interval_us = 0;   // 最近一次测到的脉冲间隔, 只用于日志
 
 void updateWheelSpeed() {
     unsigned long now = millis();
     unsigned long dt = now - lastSpeedCalc;
-    if (dt < 250) return;
+    if (dt < 100) return;
     lastSpeedCalc = now;
 
+    float kmh = 0.0f;
+    float rpm = 0.0f;
+
 #if USE_HALL_SPEED
-    float secs = dt / 1000.0f;
-    uint32_t pulses = wheel_pulse_count - lastPulseSnapshot;
-    lastPulseSnapshot = wheel_pulse_count;
-    float rpm = (pulses * 60.0f) / (MAGNET_COUNT * secs);
-    float kmh = rpm * WHEEL_CIRCUMFERENCE_M * 60.0f / 1000.0f;
+    uint32_t now_us  = micros();
+    uint32_t last_us = last_pulse_us;
+    uint32_t prev_us = prev_pulse_us;
+
+    // 停转判定: 从来没收到脉冲, 或者超过 2s 没有新脉冲
+    bool stopped = (last_us == 0) || ((uint32_t)(now_us - last_us) >= HALL_STOP_TIMEOUT_US);
+
+    if (!stopped && prev_us != 0 && last_us > prev_us) {
+        // 间隔测速: 1 磁钢时相邻脉冲间隔 = 转一圈的时间
+        uint32_t interval = last_us - prev_us;
+        last_interval_us = interval;
+        float period_s = interval / 1000000.0f;
+        rpm = 60.0f / (period_s * MAGNET_COUNT);
+        kmh = rpm * WHEEL_CIRCUMFERENCE_M * 60.0f / 1000.0f;
+    }
 #else
-    // 霍尔未安装: 直接给车速, 后面整条链路 (显示 + 协议值) 逻辑不变
-    float kmh = HARDCODE_SPEED_DM / 10.0f;
-    float rpm = kmh * 1000.0f / (WHEEL_CIRCUMFERENCE_M * 60.0f);
+    // 霍尔未启用: 直接给车速, 后面整条链路 (显示 + 协议值) 逻辑不变
+    kmh = HARDCODE_SPEED_DM / 10.0f;
+    rpm = kmh * 1000.0f / (WHEEL_CIRCUMFERENCE_M * 60.0f);
 #endif
 
     foc_status.wheel_rpm = (uint16_t)rpm;
@@ -154,9 +171,10 @@ void updateWheelSpeed() {
 void IRAM_ATTR wheelPulseISR() {
     uint32_t now = micros();
     // 1ms 消抖: 单磁钢在 30km/h 下脉冲间隔约 154ms, 1ms 阈值不会漏计真实脉冲
-    if (now - last_pulse_us > 1000) {
-        wheel_pulse_count++;
+    if (now - last_pulse_us > HALL_DEBOUNCE_US) {
+        prev_pulse_us = last_pulse_us;
         last_pulse_us = now;
+        wheel_pulse_count++;
     }
 }
 
@@ -170,7 +188,7 @@ static uint8_t foc_response_data[14] = {0};
 //   [4]    保留
 //   [5]    保留 (实车恒为 0x19)
 //   [6..8] 保留
-//   [9]    车速协议值 (0-31, int8; 负数=倒挂). ECU 换算: 仪表速度 = 值*12/25
+//   [9]    车速协议值 (0-127, int8; 负数=倒挂). ECU 换算: 仪表速度 = 值*12/25
 //   [10]   flag_1: 0x08=驻车, 0x10=能量回收
 //   [11]   保留
 // 查询子命令 05 09 的原厂 FOC 多回 2 字节 (00 02), 共 14 字节.
@@ -234,7 +252,7 @@ private:
         foc_response_data[6] = 0x00;
         foc_response_data[7] = 0x00;
         foc_response_data[8] = 0x00;
-        foc_response_data[9] = (uint8_t)foc_status.foc_speed;   // 车速协议值 (0-31)
+        foc_response_data[9] = (uint8_t)foc_status.foc_speed;   // 车速协议值 (0-127)
         foc_response_data[10] = (foc_status.foc_speed == 0) ? FOC_INFO_FLAG_1_PARKING : 0x00;
         foc_response_data[11] = 0x00;
         if (extended) {
@@ -406,9 +424,12 @@ void setup() {
 
 #if USE_HALL_SPEED
     Serial.printf("[FOC] 霍尔中断已挂载 (GPIO3, INPUT_PULLUP) — 实测模式: %d 磁钢, 周长 %.2fm\n",
-        MAGNET_COUNT, WHEEL_CIRCUMFERENCE_M); Serial.flush();
+        MAGNET_COUNT, WHEEL_CIRCUMFERENCE_M);
+    Serial.printf("[FOC] 测速方式: 脉冲间隔 (相邻两脉冲 = 转 %d 圈), 无脉冲超过 2s 判停转\n",
+        MAGNET_COUNT);
+    Serial.flush();
 #else
-    Serial.printf("[FOC] 轮速写死模式: %.1f km/h (协议值发 %d) — 霍尔装好后把 USE_HALL_SPEED 改 1\n",
+    Serial.printf("[FOC] 轮速写死模式: %.1f km/h (协议值发 %d) — 装好磁钢后把 USE_HALL_SPEED 改 1\n",
         HARDCODE_SPEED_DM / 10.0,
         calcFOCSpeedFromKMH((uint16_t)(HARDCODE_SPEED_DM / 10)));
     Serial.flush();
@@ -498,10 +519,19 @@ void loop() {
     }
 
     if (millis() - last_debug > 3000) {
+#if USE_HALL_SPEED
+        Serial.printf("[状态] %s | 轮速:%dRPM | %.1fkm/h | 间隔:%lums | 累计脉冲:%lu\n",
+            foc_status.unlocked ? "已解锁" : "已锁定",
+            foc_status.wheel_rpm,
+            foc_status.wheel_speed_dm / 10.0,
+            (unsigned long)last_interval_us,
+            (unsigned long)wheel_pulse_count);
+#else
         Serial.printf("[状态] %s | 轮速:%dRPM | %.1fkm/h\n",
             foc_status.unlocked ? "已解锁" : "已锁定",
             foc_status.wheel_rpm,
             foc_status.wheel_speed_dm / 10.0);
+#endif
         Serial.flush();
         last_debug = millis();
     }
