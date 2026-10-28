@@ -1,0 +1,147 @@
+/**
+ * 小牛 U1 电池 BMS 的 485 报文解析
+ *
+ * 总线上的角色: V35 中控 (0x40) 是主节点, 挨个轮询 FOC(0x20) / BMS(0x31) / 仪表(0x10).
+ * BMS 应答的地址对是 31 CE, 功能码 0x82 (最高位 1 = 回复), 长度字节在第 5 位.
+ *
+ * V35 会问 BMS 四种东西, 靠请求里的两个字节区分 (请求数据区 -0x33 反混淆后):
+ *
+ *   请求 2d 0f → 15 字节  电池状态   (每次轮询都问, 3 次/秒左右)
+ *   请求 09 24 → 36 字节  型号串
+ *   请求 02 2b → 43 字节  型号串 + 7 字节头
+ *   请求 3c 28 → 40 字节  单体电压
+ *
+ * 15 字节状态帧的字段布局 (来源: github.com/xzfn/scooter-repair 的 docs/niu-u-civic.md
+ * 「BMS返回的主要是电量」一节, 并用真车抓包逐字段核对过):
+ *
+ *   [0..1]  总电压   大端 uint16, 单位 0.1V     (例 0x0219 = 537 → 53.7V)
+ *   [2..4]  未知
+ *   [5]     电流     单位 A                     (实测 0..38A)
+ *   [6]     电量     单位 %
+ *   [7..9]  未知
+ *   [10..14] 5 个温度, 单位 °C
+ *
+ * 40 字节单体电压帧: 前面是单体电压 (大端 uint16, 单位 mV), 一直到第一个 0 为止,
+ * 后面是保留的 0. 13 串的 48V 电池 = 13 × 3.7V, 加起来跟状态帧的总电压对得上.
+ *
+ * 型号串帧: 36 字节的那帧串在开头, 43 字节的那帧串在第 7 字节之后 (前 7 字节是 14 04 55 55 55 55 01).
+ * 串是 16 字节 ASCII, 形如 "BUS9LN2S60900065".
+ *
+ * 这个头文件不依赖 Arduino, 可以直接在 PC 上编译跑测试 (tools 里没放测试脚本,
+ * 拿真车抓包日志喂进去逐字段核对即可).
+ */
+
+#ifndef BMS_PROTOCOL_H
+#define BMS_PROTOCOL_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+
+#define BMS_ADDR            0x31
+#define BMS_STATUS_LEN      15
+#define BMS_CELLS_LEN       40
+#define BMS_MODEL_LEN       36
+#define BMS_INFO_LEN        43
+#define BMS_MAX_CELLS       20
+#define BMS_TEMP_COUNT      5
+#define BMS_MODEL_CHARS     16
+
+// BMS 状态帧的固定长度字段
+#define BMS_OFF_VOLTAGE     0
+#define BMS_OFF_CURRENT     5
+#define BMS_OFF_SOC         6
+#define BMS_OFF_TEMPS       10
+
+struct BmsInfo {
+    // 状态帧 (15 字节)
+    bool     hasStatus;
+    uint16_t voltage_dv;              // 总电压, 0.1V
+    int16_t  current;                 // 电流, A (负数 = 回充)
+    uint8_t  soc;                     // 电量 %
+    int8_t   temps[BMS_TEMP_COUNT];   // 温度 °C
+    uint8_t  tempCount;
+
+    // 单体电压帧 (40 字节)
+    bool     hasCells;
+    uint8_t  cellCount;
+    uint16_t cellMv[BMS_MAX_CELLS];   // 单体电压, mV
+
+    // 型号串帧 (36 / 43 字节)
+    bool     hasModel;
+    char     model[BMS_MODEL_CHARS + 1];
+};
+
+// 帧头/帧尾/地址/功能码/长度
+static inline bool bmsIsReplyFrame(const uint8_t* raw, size_t len) {
+    return len >= 9
+        && raw[0] == 0x68
+        && raw[3] == 0x68
+        && raw[1] == BMS_ADDR
+        && raw[len - 1] == 0x16
+        && (raw[4] & 0x80) != 0;
+}
+
+// 校验和 = 从帧头累加到 CS 前一字节, 取低 8 位 (不是 CRC)
+static inline bool bmsChecksumOk(const uint8_t* raw, size_t len) {
+    uint16_t sum = 0;
+    for (size_t i = 0; i < len - 2; i++) sum += raw[i];
+    return (sum & 0xFF) == raw[len - 2];
+}
+
+// 解析一帧 BMS 应答. 返回 true 表示这帧是我们认识的 BMS 应答.
+// 数据区每个字节发送时 +0x33 混淆, 这里 -0x33 反混淆.
+static inline bool bmsParseFrame(const uint8_t* raw, size_t len, BmsInfo* out) {
+    if (!out || !bmsIsReplyFrame(raw, len)) return false;
+    if (!bmsChecksumOk(raw, len)) return false;
+
+    uint8_t dataLen = raw[5];
+    if ((size_t)dataLen + 8 != len) return false;   // 长度字段和实际帧长对不上
+
+    uint8_t plain[BMS_INFO_LEN];
+    for (uint8_t i = 0; i < dataLen; i++) {
+        plain[i] = (uint8_t)(raw[6 + i] - 0x33);
+    }
+
+    if (dataLen == BMS_STATUS_LEN) {
+        out->hasStatus = true;
+        out->voltage_dv = (uint16_t)((plain[BMS_OFF_VOLTAGE] << 8) | plain[BMS_OFF_VOLTAGE + 1]);
+        out->current  = (int8_t)plain[BMS_OFF_CURRENT];
+        out->soc      = plain[BMS_OFF_SOC];
+        out->tempCount = BMS_TEMP_COUNT;
+        for (uint8_t i = 0; i < BMS_TEMP_COUNT; i++) {
+            out->temps[i] = (int8_t)plain[BMS_OFF_TEMPS + i];
+        }
+        return true;
+    }
+
+    if (dataLen == BMS_CELLS_LEN) {
+        out->hasCells = true;
+        out->cellCount = 0;
+        for (uint8_t i = 0; i < BMS_MAX_CELLS; i++) {
+            uint16_t mv = (uint16_t)((plain[i * 2] << 8) | plain[i * 2 + 1]);
+            if (mv == 0) break;              // 后面是保留的 0
+            out->cellMv[out->cellCount++] = mv;
+        }
+        return true;
+    }
+
+    if (dataLen == BMS_MODEL_LEN || dataLen == BMS_INFO_LEN) {
+        uint8_t off = (dataLen == BMS_INFO_LEN) ? 7 : 0;
+        uint8_t n = 0;
+        for (uint8_t i = 0; i < BMS_MODEL_CHARS && off + i < dataLen; i++) {
+            uint8_t c = plain[off + i];
+            if (c < 0x20 || c > 0x7E) break;   // 不是可打印 ASCII 就停
+            out->model[n++] = (char)c;
+        }
+        if (n > 0) {
+            out->model[n] = '\0';
+            out->hasModel = true;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+#endif

@@ -8,6 +8,12 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 
+#include "ota_config.h"
+#include "ota_server.h"
+#include "ble_config.h"
+#include "ble_telemetry.h"
+#include "bms_protocol.h"
+
 // ============ OLED 引脚定义 (板载I2C: SDA=GPIO5, SCL=GPIO6) ============
 #define I2C_SDA_PIN 5
 #define I2C_SCL_PIN 6
@@ -33,7 +39,11 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_MIRROR, /* reset=*/ U8X8_PIN_NONE)
 
 // 霍尔测速参数
 #define HALL_DEBOUNCE_US      1000      // ISR 消抖: 1ms, 远小于最慢的真实脉冲间隔
-#define HALL_STOP_TIMEOUT_US  2000000   // 2s 没有新脉冲 → 认为停转, 车速归 0
+#define HALL_STOP_TIMEOUT_US  3000000   // 3s 没有新脉冲 → 认为停转, 车速归 0
+// 停转阈值定 3s 是为了顾到低速骑行: 3s 转一圈 = 1.28m/3s = 1.5 km/h,
+// 也就是低于 1.5km/h 仪表本来就看不出差别, 归零没有损失; 而 2s 的话
+// 3~5km/h 的"蠕行"会整段显示 0 (间隔 1.5~2.3s 正好卡在阈值上).
+#define HALL_HISTORY          5         // 取中位数的样本数 (奇数)
 
 // ============ 联调测试开关 ============
 // 485 每秒主动发一帧测试数据, 用来确认 ESP32 确实在往总线上发.
@@ -43,6 +53,14 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_MIRROR, /* reset=*/ U8X8_PIN_NONE)
 // 联调完记得改回 0 —— 测试帧是协议里没有的功能码, 会干扰 V35 ECU 的正常轮询.
 #define TEST_485_ENABLE      0
 #define TEST_485_INTERVAL_MS 1000
+
+// 调试开关: 从 USB CDC 往 485 解析链路里塞一帧 —— 车不在手边时也能验 BMS 解析.
+// 在串口里敲 "[TX] 68 31 CE 68 82 0F ... 16" 回车即可 (只认 [TX] 开头的行).
+#define DEBUG_INJECT_485     1
+
+// 485 收发的调试回显 (镜像到 USB CDC). 关掉可以省掉 USB 上的开销,
+// 车上跑的时候 USB 一般没插, 回显写进环形缓冲区就丢了, 不影响应答时序.
+#define DEBUG_485_ECHO       1
 
 // 板载 LED — 用来肉眼确认程序活着且在跑 loop.
 // ESP32-C3 常见 LED 都在 GPIO8; 如果不亮, 改成 2 / 4 / 5 试 (别用 3/4/6/7, 那些被外设占了).
@@ -107,13 +125,38 @@ static FOCStatus foc_status = {
     .error = 0x00, .unlocked = 0, .unlock_timestamp = 0
 };
 
+#if BLE_ENABLE
+// BLE 遥测实例 —— 声明要放在 FOCSimulator 前面, parseFrame 里要用
+BleTelemetry bleTelemetry;
+#endif
+
+// ============ 电池 BMS ============
+// 总线上 V35 挨个轮询, BMS(0x31) 的应答我们只在旁边听着 —— 不参与应答,
+// 但把电压/电流/电量/温度/单体电压解析出来给小程序看.
+static BmsInfo bms_info = {0};
+static unsigned long bms_last_log = 0;
+
 // ============ 轮速测量 ============
 // 单磁钢 + 计数窗口测不出速度: 17km/h 时 250ms 窗口只期望 0.9 个脉冲, 读数会在
 // 0 和 ~24km/h 之间乱跳. 所以改用"脉冲间隔"测速 —— 相邻两个脉冲之间正好转了
 // MAGNET_COUNT 圈, 17km/h 时间隔 270ms, 分辨率 0.4%.
+//
+// 但"直接用最近一次间隔"有两个坑, 表现就是"有时候没有速度":
+//   1) 漏脉冲: 磁钢经过传感器那一下没被捕捉到 (颠簸/干扰), 间隔直接变 2 倍
+//      → 车速凭空减半, 下一拍又跳回去
+//   2) 抖动: 传感器输出毛刺, 一个真间隔被劈成两半
+//      → 车速凭空翻倍
+// 修法: 保留最近 HALL_HISTORY 个间隔取**中位数**. 中位数天生抗离群值 ——
+// 漏一个脉冲 (5 个里 1 个是 2 倍) 不影响中位数, 毛刺劈出的两个半间隔也一样.
+// 代价是车速变化有 2~3 拍的滞后 (17km/h 时约 0.8s), 换来的是稳.
 volatile uint32_t wheel_pulse_count = 0;
 volatile uint32_t last_pulse_us = 0;    // 最近一个脉冲的时刻
 volatile uint32_t prev_pulse_us = 0;    // 上一个脉冲的时刻 (两者之差 = 一圈时间)
+static uint32_t hall_hist_us[HALL_HISTORY] = {0};   // 最近几个间隔
+static uint8_t hall_hist_cnt = 0;
+static uint8_t hall_hist_idx = 0;
+static uint32_t hall_used_pulse_us = 0;   // 已经算过间隔的那个脉冲时刻
+static uint32_t hall_gap_reset = 0;       // 因停车太久重置过历史的次数 (诊断用)
 
 // 协议速度值 — 线性刻度, 1 格 = 12/25 = 0.48 km/h
 // 依据:
@@ -132,6 +175,31 @@ uint16_t calcFOCSpeedFromKMH(float kmh) {
 static unsigned long lastSpeedCalc = 0;
 static uint32_t last_interval_us = 0;   // 最近一次测到的脉冲间隔, 只用于日志
 
+// 取最近若干个间隔的中位数 —— 抗漏脉冲和抗毛刺都靠它
+static uint32_t hallMedianInterval() {
+    if (hall_hist_cnt == 0) return 0;
+    uint32_t tmp[HALL_HISTORY];
+    for (uint8_t i = 0; i < hall_hist_cnt; i++) tmp[i] = hall_hist_us[i];
+    for (uint8_t i = 1; i < hall_hist_cnt; i++) {
+        uint32_t key = tmp[i];
+        int8_t j = (int8_t)i - 1;
+        while (j >= 0 && tmp[j] > key) { tmp[j + 1] = tmp[j]; j--; }
+        tmp[j + 1] = key;
+    }
+    return tmp[hall_hist_cnt / 2];
+}
+
+static void hallHistReset() {
+    hall_hist_cnt = 0;
+    hall_hist_idx = 0;
+}
+
+static void hallHistPush(uint32_t interval) {
+    hall_hist_us[hall_hist_idx] = interval;
+    hall_hist_idx = (uint8_t)((hall_hist_idx + 1) % HALL_HISTORY);
+    if (hall_hist_cnt < HALL_HISTORY) hall_hist_cnt++;
+}
+
 void updateWheelSpeed() {
     unsigned long now = millis();
     unsigned long dt = now - lastSpeedCalc;
@@ -146,16 +214,31 @@ void updateWheelSpeed() {
     uint32_t last_us = last_pulse_us;
     uint32_t prev_us = prev_pulse_us;
 
-    // 停转判定: 从来没收到脉冲, 或者超过 2s 没有新脉冲
+    // 有新脉冲 → 产生一个新的间隔, 推进历史
+    if (last_us != hall_used_pulse_us && prev_us != 0 && last_us > prev_us) {
+        hall_used_pulse_us = last_us;
+        uint32_t interval = last_us - prev_us;
+        if (interval >= HALL_STOP_TIMEOUT_US) {
+            // 间隔里含了停车时间 (停了很久又起步), 这一拍速度不可信:
+            // 历史全部作废, 车速按 0 起算, 让下一拍从干净状态重新收敛
+            hallHistReset();
+            hall_gap_reset++;
+        } else {
+            hallHistPush(interval);
+            last_interval_us = interval;
+        }
+    }
+
+    // 停转判定: 从来没收到脉冲, 或者超过阈值没有新脉冲
     bool stopped = (last_us == 0) || ((uint32_t)(now_us - last_us) >= HALL_STOP_TIMEOUT_US);
 
-    if (!stopped && prev_us != 0 && last_us > prev_us) {
-        // 间隔测速: 1 磁钢时相邻脉冲间隔 = 转一圈的时间
-        uint32_t interval = last_us - prev_us;
-        last_interval_us = interval;
-        float period_s = interval / 1000000.0f;
-        rpm = 60.0f / (period_s * MAGNET_COUNT);
-        kmh = rpm * WHEEL_CIRCUMFERENCE_M * 60.0f / 1000.0f;
+    if (!stopped) {
+        uint32_t base = hallMedianInterval();
+        if (base > 0) {
+            float period_s = base / 1000000.0f;
+            rpm = 60.0f / (period_s * MAGNET_COUNT);
+            kmh = rpm * WHEEL_CIRCUMFERENCE_M * 60.0f / 1000.0f;
+        }
     }
 #else
     // 霍尔未启用: 直接给车速, 后面整条链路 (显示 + 协议值) 逻辑不变
@@ -233,10 +316,14 @@ private:
         setTransmitMode(true);
         serial->write(frame, idx);
         serial->flush();
-        // 调试回显：镜像到 USB CDC (独立通道，不污染 485)
+#if DEBUG_485_ECHO
+        // 调试回显：镜像到 USB CDC (独立通道，不污染 485).
+        // 刻意不调 Serial.flush() —— USB 接上电脑时 flush 最长阻塞 100ms,
+        // 而 V35 的单次轮询超时只有 ~20ms, 卡一次这一轮就黄了.
         Serial.printf("[485→] ");
         for (size_t i = 0; i < idx; i++) Serial.printf("%02X ", frame[i]);
         Serial.printf("\n");
+#endif
         // 自动收发模块切换有 ~1-2ms 延迟；flush 后等一下让总线稳定
         delay(3);
         setTransmitMode(false);
@@ -264,6 +351,16 @@ private:
 public:
     FOCSimulator(HardwareSerial* s) : serial(s) {}
 
+    // 诊断计数 —— 小程序上要看"到底是谁的问题":
+    //   q_count  收到 V35 的状态查询次数 (05 08 / 05 09)
+    //   a_count  我们回出去的应答次数 (应该跟 q_count 一致)
+    //   bad_cs   校验和对不上的帧 (总线噪声/干扰)
+    //   oth      其它功能码的查询次数 (解锁/配置等)
+    uint16_t q_count = 0;
+    uint16_t a_count = 0;
+    uint16_t bad_cs = 0;
+    uint16_t oth = 0;
+
     // 联调用: 主动往 485 总线发一帧, 确认 ESP32 确实在发.
     // 用的是协议里没定义过的功能码 0xEE, 不会跟 V35 ECU 的正常轮询混淆.
     void sendTestFrame() {
@@ -284,10 +381,14 @@ public:
         // 05 09 = U M-Sport 的状态查询 → 原厂回 14 字节
         if (data[0] == 0x05 && data[1] == 0x08) {
             updateFOCResponse(false);
+            q_count++;
             sendFrame(FUNC_RESPONSE, foc_response_data, 12);
+            a_count++;
         } else if (data[0] == 0x05 && data[1] == 0x09) {
             updateFOCResponse(true);
+            q_count++;
             sendFrame(FUNC_RESPONSE, foc_response_data, 14);
+            a_count++;
         }
     }
 
@@ -317,8 +418,9 @@ public:
                 // 静默处理：V35 后续会发 0x02 查询具体值
                 break;
             default:
+#if DEBUG_485_ECHO
                 Serial.printf("[V35] unknown control: 0x%02X len=%d\n", data[0], len);
-                Serial.flush();
+#endif
                 break;
         }
     }
@@ -330,8 +432,9 @@ public:
 
     void handleWriteParam(const uint8_t* data, uint8_t len) {
         // V35 数据写入 (0x04) — 只 ACK
+#if DEBUG_485_ECHO
         Serial.printf("[V35] FUNC_WRITE_PARAM: %d bytes\n", len);
-        Serial.flush();
+#endif
         uint8_t ack_data[] = { 0xCD };
         sendFrame(FUNC_WRITE_PARAM_ACK, ack_data, 1);
     }
@@ -339,6 +442,7 @@ public:
     void handleConfigSystem(const uint8_t* data, uint8_t len) {
         // V35 系统配置 (0x06) — 主/从模式等
         uint8_t subcmd = len > 0 ? data[0] : 0xFF;
+#if DEBUG_485_ECHO
         const char* mode = "?";
         switch (subcmd) {
             case 0x01: mode = "set_slave"; break;
@@ -346,7 +450,7 @@ public:
             default:    mode = "other";    break;
         }
         Serial.printf("[V35] FUNC_CONFIG_SYSTEM: subcmd=0x%02X (%s)\n", subcmd, mode);
-        Serial.flush();
+#endif
         // 原厂 FOC 对 0x06 的确认是空数据 (抓包: 68 20 DF 68 86 00 CS 16)
         static const uint8_t empty[] = {0x00};
         sendFrame(FUNC_CONFIG_SYSTEM_ACK, empty, 0);
@@ -354,6 +458,15 @@ public:
 
     void parseFrame(const uint8_t* raw_frame, size_t len) {
         if (len < 9 || raw_frame[0] != 0x68 || raw_frame[len-1] != 0x16) return;
+#if BLE_ENABLE
+        // 总线上抓到的帧原样推给手机 —— 不管是发给谁的问询帧都推
+        bleTelemetry.pushFrame(raw_frame, len);
+#endif
+        // 电池 BMS 的应答 —— 我们不是 BMS, 不应答, 只在旁边听并解析
+        if (raw_frame[1] == BMS_ADDR) {
+            bmsParseFrame(raw_frame, len, &bms_info);
+            return;
+        }
         uint8_t addr = raw_frame[1];
         uint8_t addr_inv = raw_frame[2];
         uint8_t func = raw_frame[4];
@@ -364,6 +477,15 @@ public:
         if (raw_frame[3] != 0x68) return;
         // 只处理发往本设备 (FOC) 的帧
         if (addr != FOC_ADDR) return;
+        // 校验和 (协议是"从头累加到 CS 前一字节, 取低 8 位", 不是 CRC).
+        // 不校验的话, 总线上的噪声/干扰会被当成一个查询, 我们回一帧,
+        // 反而把 V35 的应答时序搞乱 —— 宁可漏答, 不能乱答.
+        uint8_t cs = 0;
+        for (size_t i = 0; i + 2 < len; i++) cs = (uint8_t)(cs + raw_frame[i]);
+        if (cs != raw_frame[len - 2]) {
+            bad_cs++;
+            return;
+        }
         uint8_t data[32] = {0};
         uint8_t actual_len = min(data_len, (uint8_t)32);
         for (uint8_t i = 0; i < actual_len; i++) {
@@ -371,19 +493,85 @@ public:
         }
         switch (func & 0x7F) {
             case FUNC_QUERY:           handleQuery(data, actual_len); break;
-            case FUNC_CONTROL:         handleControl(data, actual_len); break;
-            case FUNC_SET_PARAM:       handleSetParam(data, actual_len); break;
-            case FUNC_WRITE_PARAM:     handleWriteParam(data, actual_len); break;
-            case FUNC_CONFIG_SYSTEM:   handleConfigSystem(data, actual_len); break;
+            case FUNC_CONTROL:         handleControl(data, actual_len); oth++; break;
+            case FUNC_SET_PARAM:       handleSetParam(data, actual_len); oth++; break;
+            case FUNC_WRITE_PARAM:     handleWriteParam(data, actual_len); oth++; break;
+            case FUNC_CONFIG_SYSTEM:   handleConfigSystem(data, actual_len); oth++; break;
         }
     }
 };
 
 FOCSimulator simulator(&Serial1);
 
+#if OTA_AP_ENABLE
+OtaService otaService;
+#endif
+
 static uint8_t rx_buf[256];
 static size_t rx_len = 0;
 static unsigned long last_debug = 0;
+#if DEBUG_INJECT_485
+static char injectBuf[512];
+static size_t injectLen = 0;
+static int injectHexPos = 0;
+static int injectHi = 0;
+#endif
+
+// ============ 485 接收: 按长度字节定帧 ============
+// 不要靠 0x16 找帧尾: 数据区里也可能出现 0x16 (明文 0xE3 + 0x33 混淆后正好是 0x16),
+// 靠 0x16 分帧会把一帧劈成两半, 后面那一半会被当成新帧, 结果是 BMS 的应答解析不出来.
+// 正确做法: 第 6 个字节是数据长度, 整帧长度 = 6 + len + 2 (校验和 + 0x16).
+static void rxResync() {
+    size_t i = 1;
+    while (i < rx_len && rx_buf[i] != 0x68) i++;
+    if (i < rx_len) {
+        memmove(rx_buf, rx_buf + i, rx_len - i);
+        rx_len -= i;
+    } else {
+        rx_len = 0;
+    }
+#if DEBUG_485_ECHO
+    Serial.printf("\n[485] 重新同步\n");
+#endif
+}
+
+static void rxPush(uint8_t c) {
+    if (rx_len == 0) {
+        // 总线空闲时会有 fe / 55 之类的填充字节, 不是 0x68 就丢掉
+        if (c != 0x68) return;
+#if DEBUG_485_ECHO
+        Serial.printf("[485←] ");
+#endif
+        rx_buf[rx_len++] = c;
+#if DEBUG_485_ECHO
+        Serial.printf("%02X ", c);
+#endif
+        return;
+    }
+    if (rx_len >= sizeof(rx_buf)) { rxResync(); return; }
+    rx_buf[rx_len++] = c;
+#if DEBUG_485_ECHO
+    Serial.printf("%02X ", c);
+#endif
+
+    if (rx_len == 4) {
+        if (rx_buf[3] != 0x68) { rxResync(); return; }   // 不是帧
+        return;
+    }
+    if (rx_len < 6) return;
+
+    size_t total = 6 + (size_t)rx_buf[5] + 2;
+    if (total > sizeof(rx_buf)) { rxResync(); return; }   // 长度离谱, 重新同步
+    if (rx_len == total) {
+        // 先应答, 后回显 —— V35 的单次轮询超时只有 ~20ms,
+        // 任何阻塞式的 USB flush 都可能把这一轮拖成超时 (表现为车速 0 + 错误码 190)
+#if DEBUG_485_ECHO
+        Serial.printf("\n");
+#endif
+        simulator.parseFrame(rx_buf, rx_len);
+        rx_len = 0;
+    }
+}
 
 void setup() {
     disableLoopWDT();
@@ -439,6 +627,19 @@ void setup() {
     Serial.print("[OLED] 初始化完成\n"); Serial.flush();
 
     Serial.printf("[MEM] free=%d\n", esp_get_free_heap_size()); Serial.flush();
+
+#if OTA_AP_ENABLE
+    // 放最后: WiFi 初始化要 100ms 左右, 别拖慢 485 起步
+    otaService.begin();
+#endif
+
+#if BLE_ENABLE
+    // 再放最后: bluedroid 启动要几百 ms + 几十 KB 堆, 绝不能拖慢 485 起步.
+    // 失败也无所谓 —— 485 和 OTA 都不依赖 BLE.
+    bleTelemetry.begin();
+    Serial.printf("[MEM] BLE 之后 free=%d\n", esp_get_free_heap_size()); Serial.flush();
+#endif
+
     Serial.print("[READY] 等待 V35 ECU 轮询\n"); Serial.flush();
 }
 
@@ -459,9 +660,13 @@ void drawOled() {
     u8g2.setCursor((128 - w) / 2 + w + 4, 24);
     u8g2.print("km/h");
 
-    // 底部: RPM + 错误码
+    // 底部: 电量 + RPM + 错误码
     char bottom[32];
-    snprintf(bottom, sizeof(bottom), "%d RPM", (int)foc_status.wheel_rpm);
+    if (bms_info.hasStatus) {
+        snprintf(bottom, sizeof(bottom), "%d%%  %d RPM", bms_info.soc, (int)foc_status.wheel_rpm);
+    } else {
+        snprintf(bottom, sizeof(bottom), "%d RPM", (int)foc_status.wheel_rpm);
+    }
     u8g2.setCursor(0, 55);
     u8g2.print(bottom);
     if (foc_status.error != 0) {
@@ -475,26 +680,120 @@ void drawOled() {
     u8g2.sendBuffer();
 }
 
+// OTA 传输中抢下屏幕: 显示热点名/IP/进度, 让人一眼知道在干嘛
+void drawOledOta() {
+    u8g2.clearBuffer();
+    u8g2.setDrawColor(1);
+    u8g2.setFont(u8g2_font_6x10_tf);
+
+    u8g2.setCursor(0, 2);
+    u8g2.printf("OTA  %s", OTA_AP_SSID);
+
+    u8g2.setCursor(0, 14);
+    u8g2.printf("IP %s:%d", WiFi.softAPIP().toString().c_str(), OTA_HTTP_PORT);
+
+    // 进度条
+    uint32_t total = otaService.total();
+    uint32_t cur = otaService.progress();
+    u8g2.drawFrame(0, 24, 128, 12);
+    int w = total ? (int)((124 * (uint32_t)cur) / total) : 0;
+    if (w > 0) u8g2.drawBox(2, 26, w, 8);
+
+    u8g2.setCursor(0, 40);
+    u8g2.printf("%u/%u KB  %d%%", cur / 1024, total / 1024,
+                total ? (int)((uint32_t)cur * 100 / total) : 0);
+
+    u8g2.setCursor(0, 52);
+    u8g2.print("keep this page open");
+
+    u8g2.sendBuffer();
+}
+
 void loop() {
+#if DEBUG_INJECT_485
+    // 调试用: USB CDC 上敲 "[TX] 68 31 CE ... 16" 回车, 把字节喂进 485 解析链路.
+    // 没有车的时候也能验 BMS 解析 —— 但只认 [TX] 开头的行, 免得误敲的字符被当成帧.
+    while (Serial.available()) {
+        int c = Serial.read();
+        if (c < 0) break;
+        if (c == '\n' || c == '\r') {
+            injectBuf[injectLen] = 0;
+            if (strncmp(injectBuf, "[TX]", 4) == 0) {
+                uint8_t tmp[128];
+                size_t n = 0;
+                for (size_t i = 4; i < injectLen && n < sizeof(tmp); i++) {
+                    char ch = injectBuf[i];
+                    int hi = -1;
+                    if (ch >= '0' && ch <= '9') hi = ch - '0';
+                    else if (ch >= 'a' && ch <= 'f') hi = ch - 'a' + 10;
+                    else if (ch >= 'A' && ch <= 'F') hi = ch - 'A' + 10;
+                    if (hi < 0) continue;
+                    if (injectHexPos == 0) { injectHi = hi; injectHexPos = 1; continue; }
+                    injectHexPos = 0;
+                    tmp[n++] = (uint8_t)((injectHi << 4) | hi);
+                }
+                for (size_t i = 0; i < n; i++) rxPush(tmp[i]);
+                Serial.printf("[注入] %d 字节\n", (int)n);
+            }
+            injectLen = 0;
+            injectHexPos = 0;
+            Serial.flush();
+        } else if (injectLen < sizeof(injectBuf) - 1) {
+            injectBuf[injectLen++] = (char)c;
+        }
+    }
+#endif
+
     while (Serial1.available()) {
         int c = Serial1.read();
-        if (c >= 0) {
-            if (rx_len == 0) Serial.printf("[485←] ");
-            Serial.printf("%02X ", c);
-            rx_buf[rx_len++] = (uint8_t)c;
-            if (c == 0x16 && rx_len > 9) {
-                Serial.printf("\n"); Serial.flush();  // 帧边界 flush
-                simulator.parseFrame(rx_buf, rx_len);
-                rx_len = 0;
-            }
-            if (rx_len >= sizeof(rx_buf)) {
-                Serial.printf("[overflow]\n"); Serial.flush();
-                rx_len = 0;
-            }
-        }
+        if (c >= 0) rxPush((uint8_t)c);
     }
 
     updateWheelSpeed();
+
+#if OTA_AP_ENABLE
+    // HTTP 收包在主循环里跑, 4KB 一块只阻塞几 ms, 不影响 485 的 200ms 轮询
+    otaService.handle();
+#endif
+
+#if BLE_ENABLE
+    bleTelemetry.publish({
+        .speed_dm = foc_status.wheel_speed_dm,
+        .rpm = foc_status.wheel_rpm,
+        .voltage = foc_status.voltage,
+        .current = foc_status.current,
+        .protocol_speed = (uint8_t)foc_status.foc_speed,
+        .error = foc_status.error,
+        .unlocked = foc_status.unlocked,
+        .flags = 0,
+        .q_count = simulator.q_count,
+        .a_count = simulator.a_count,
+        .pulse_count = (uint16_t)wheel_pulse_count,
+        .bad_cs = (uint8_t)simulator.bad_cs,
+        .interval_x10 = (uint8_t)(last_interval_us / 10000 > 255 ? 255 : last_interval_us / 10000),
+    });
+    bleTelemetry.publishBattery(bms_info);
+    bleTelemetry.handle();
+#endif
+
+    // 电池状态每秒打一行 —— 车上没接 BLE 时也能在串口里看到
+    if (bms_info.hasStatus && millis() - bms_last_log > 1000) {
+        bms_last_log = millis();
+        Serial.printf("[BMS] %.1fV  %dA  电量 %d%%  温度 %d/%d/%d/%d/%d",
+            bms_info.voltage_dv / 10.0f, bms_info.current, bms_info.soc,
+            bms_info.temps[0], bms_info.temps[1], bms_info.temps[2],
+            bms_info.temps[3], bms_info.temps[4]);
+        if (bms_info.hasCells) {
+            uint16_t minMv = 0xFFFF, maxMv = 0;
+            for (uint8_t i = 0; i < bms_info.cellCount; i++) {
+                if (bms_info.cellMv[i] < minMv) minMv = bms_info.cellMv[i];
+                if (bms_info.cellMv[i] > maxMv) maxMv = bms_info.cellMv[i];
+            }
+            Serial.printf("  单体 %d 串 %.3f~%.3fV", bms_info.cellCount,
+                minMv / 1000.0f, maxMv / 1000.0f);
+        }
+        Serial.printf("\n");
+    }
 
 #if TEST_485_ENABLE
     // 每秒主动发一帧测试数据 — 确认 ESP32 确实在往 485 总线上发
@@ -514,25 +813,40 @@ void loop() {
 
     static unsigned long lastOledUpdate = 0;
     if (millis() - lastOledUpdate > 200) {
+#if OTA_AP_ENABLE
+        if (otaService.isBusy()) {
+            drawOledOta();
+        } else {
+            drawOled();
+        }
+#else
         drawOled();
+#endif
         lastOledUpdate = millis();
     }
 
     if (millis() - last_debug > 3000) {
 #if USE_HALL_SPEED
-        Serial.printf("[状态] %s | 轮速:%dRPM | %.1fkm/h | 间隔:%lums | 累计脉冲:%lu\n",
+        Serial.printf("[状态] %s | 轮速:%dRPM | %.1fkm/h | 间隔:%lums | 脉冲:%lu | 停车重置:%lu\n",
             foc_status.unlocked ? "已解锁" : "已锁定",
             foc_status.wheel_rpm,
             foc_status.wheel_speed_dm / 10.0,
             (unsigned long)last_interval_us,
-            (unsigned long)wheel_pulse_count);
+            (unsigned long)wheel_pulse_count,
+            (unsigned long)hall_gap_reset);
 #else
         Serial.printf("[状态] %s | 轮速:%dRPM | %.1fkm/h\n",
             foc_status.unlocked ? "已解锁" : "已锁定",
             foc_status.wheel_rpm,
             foc_status.wheel_speed_dm / 10.0);
 #endif
-        Serial.flush();
+        // 485 侧的对答情况 —— 排查"仪表没速度"时先看这两个数:
+        //   查询次数应该一直涨 (涨=总线通), 应答次数要跟查询次数一致
+        Serial.printf("[485] 查询:%u 应答:%u 其它:%u 校验错:%u | 协议车速:%u\n",
+            simulator.q_count, simulator.a_count, simulator.oth, simulator.bad_cs,
+            foc_status.foc_speed);
+        // 刻意不 flush —— USB 接上电脑但没人读时, flush 会卡住主循环最多 100ms,
+        // 而 V35 的轮询超时只有 ~20ms, 卡一次这一轮就变成"没应答→错误码190→车速0"
         last_debug = millis();
     }
 }

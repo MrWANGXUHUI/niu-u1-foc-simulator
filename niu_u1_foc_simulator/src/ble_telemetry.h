@@ -1,0 +1,288 @@
+/**
+ * BLE 遥测 — 把 485 总线上的车辆状态推给微信小程序
+ *
+ * 为什么单独开一条 BLE 通道:
+ *   OTA 走 WiFi 热点, 手机一连热点就断网, 推送完还得手动切回去;
+ *   看车速不需要断网, BLE 直连更顺手. 两条通道互不干扰, 可以同时开着.
+ *
+ * GATT 结构:
+ *   Service  6e400001-b5a3-f393-e0a9-e50e24dcca9e
+ *     ├─ 6e400002  notify  车辆状态, 20 字节小端 (见 BleTelemetryData)
+ *     ├─ 6e400003  notify  485 总线上抓到的原始帧 (最新一帧的字节)
+ *     └─ 6e400004  notify  电池信息 (BMS 解析结果, 消息分片格式, 见下面)
+ *
+ * 电池信息的消息格式 —— 一条特征上跑多种消息, 每条 notify 带一个 3 字节消息头:
+ *
+ *   [0] 消息类型   1=状态 2=单体电压 3=型号串
+ *   [1] 分片序号   从 0 开始
+ *   [2] 分片总数
+ *   [3..] 数据
+ *
+ *   状态 (17 字节): flags | 电量% | 总电压0.1V | 电流0.1A | 温度个数 | 5×温度 |
+ *                    单体串数 | 最低单体mV | 最高单体mV
+ *   单体电压: 每格 2 字节 mV (小端), 一片最多带 8 格
+ *   型号串: 16 字节 ASCII
+ *
+ * 分片是因为协商不出 MTU 时单条 notify 只能发 20 字节, 而单体电压 13 串就有 26 字节.
+ *
+ * 注意事项:
+ *   1) Arduino-ESP32 2.0.x 自带的 BLE 库在 C3 上能编能跑 (Bluedroid, 无经典蓝牙),
+ *      但它吃内存 —— bluedroid 初始化要几十 KB 堆. 所以 begin() 放 setup 最后,
+ *      失败也不能影响 485.
+ *   2) notify 的长度上限由协商出来的 MTU 决定 (最小 20), 帧长按 BLE_MAX_NOTIFY_LEN 切块.
+ */
+
+#ifndef BLE_TELEMETRY_H
+#define BLE_TELEMETRY_H
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#include "ble_config.h"
+#include "bms_protocol.h"
+#include "ble_battery_msg.h"
+
+// 遥测载荷: 小端, 20 字节
+struct BleTelemetryData {
+    uint16_t speed_dm;        // 车速 ×10 (十分位)
+    uint16_t rpm;             // 轮速转速
+    uint16_t voltage;         // 电压 (0.1V)
+    int16_t  current;         // 电流 (0.1A)
+    uint8_t  protocol_speed;  // 485 协议车速值 (0-127)
+    uint8_t  error;           // 错误码
+    uint8_t  unlocked;        // 1 = 已解锁
+    uint8_t  flags;           // bit0: 刚收到过 485 帧
+    // ↓ 诊断字段: 骑车时用小程序一眼分清"是霍尔没脉冲"还是"485 没应答"
+    uint16_t q_count;         // 收到 V35 状态查询的次数
+    uint16_t a_count;         // 我们回出去的应答次数 (应与 q_count 相等)
+    uint16_t pulse_count;     // 霍尔脉冲累计数 (低 16 位)
+    uint8_t  bad_cs;          // 校验和不对的帧数 (总线干扰)
+    uint8_t  interval_x10;    // 最近一次脉冲间隔 (10ms 单位)
+};
+
+class BleTelemetry {
+public:
+    BleTelemetry() : serverCb_(this) {}
+
+    // BLE 初始化 (bluedroid 启动, 几百 ms). 失败返回 false, 不影响 485 主功能
+    bool begin() {
+        BLEDevice::init(BLE_DEVICE_NAME);
+        BLEDevice::setMTU(185);
+
+        BLEServer* server = BLEDevice::createServer();
+        server->setCallbacks(&serverCb_);
+
+        BLEService* svc = server->createService(BLE_SERVICE_UUID);
+
+        telemetry_ = svc->createCharacteristic(BLE_TELEMETRY_UUID,
+                                               BLECharacteristic::PROPERTY_NOTIFY |
+                                               BLECharacteristic::PROPERTY_READ);
+        telemetry_->addDescriptor(new BLE2902());
+
+        frame_ = svc->createCharacteristic(BLE_FRAME_UUID,
+                                           BLECharacteristic::PROPERTY_NOTIFY |
+                                           BLECharacteristic::PROPERTY_READ);
+        frame_->addDescriptor(new BLE2902());
+
+        battery_ = svc->createCharacteristic(BLE_BATTERY_UUID,
+                                             BLECharacteristic::PROPERTY_NOTIFY |
+                                             BLECharacteristic::PROPERTY_READ);
+        battery_->addDescriptor(new BLE2902());
+
+        svc->start();
+
+        BLEAdvertising* adv = BLEDevice::getAdvertising();
+        adv->addServiceUUID(BLE_SERVICE_UUID);
+        adv->setScanResponse(true);   // 128 位 UUID 放扫描回应里, 广播包放名字
+        adv->start();
+
+        connected_ = false;
+        Serial.printf("[BLE] 已启动 %s, 剩余堆 %u 字节\n",
+                      BLE_DEVICE_NAME, (unsigned)ESP.getFreeHeap());
+        return true;
+    }
+
+    bool connected() const { return connected_; }
+
+    // 存一份最新状态, 由 handle() 按 BLE_NOTIFY_PERIOD_MS 推给手机
+    void publish(const BleTelemetryData& d) { data_ = d; }
+
+    // 485 总线上的原始帧 —— 让小程序能看到 ECU 到底在问什么
+    void pushFrame(const uint8_t* raw, size_t len) {
+        if (!raw || len == 0) return;
+        if (len > sizeof(frameBuf_)) len = sizeof(frameBuf_);
+        memcpy(frameBuf_, raw, len);
+        frameLen_ = len;
+        frameSeq_++;
+        data_.flags |= 0x01;
+    }
+
+    // 电池信息 —— BMS 应答解析出来的结果
+    void publishBattery(const BmsInfo& info) { bms_ = info; }
+
+    // 主循环里调, 不阻塞
+    void handle() {
+        unsigned long now = millis();
+
+        // 断了以后要重新广播. 关键: 不能在 BLE 的回调里直接调 advertising->start() ——
+        // 那个回调跑在蓝牙任务里, 这时候 GAP 状态机还没处理完断连, 启动广播会被
+        // 静默丢掉 (设备就再也不广播了, 手机再也扫不到). 必须延后到主循环再启动.
+        if (advRestartAt_ && (int32_t)(now - advRestartAt_) >= 0) {
+            BLEDevice::getAdvertising()->start();
+            advRestartAt_ = 0;
+            lastDisconnectAt_ = now;
+            Serial.println("[BLE] 重新广播");
+        } else if (!connected_ && lastDisconnectAt_ &&
+                   (now - lastDisconnectAt_) > 30000) {
+            // 兜底: 断连 30 秒后还是扫不到设备, 说明广播没起来, 再试一次
+            BLEDevice::getAdvertising()->start();
+            lastDisconnectAt_ = now;
+            Serial.println("[BLE] 广播没起来, 重试");
+        }
+
+        if (!connected_) return;
+        if (now - lastNotify_ < BLE_NOTIFY_PERIOD_MS) return;
+        lastNotify_ = now;
+
+        uint8_t buf[20];
+        buf[0]  = data_.speed_dm & 0xFF;
+        buf[1]  = data_.speed_dm >> 8;
+        buf[2]  = data_.rpm & 0xFF;
+        buf[3]  = data_.rpm >> 8;
+        buf[4]  = data_.voltage & 0xFF;
+        buf[5]  = data_.voltage >> 8;
+        buf[6]  = data_.current & 0xFF;
+        buf[7]  = (uint16_t)(data_.current >> 8) & 0xFF;
+        buf[8]  = data_.protocol_speed;
+        buf[9]  = data_.error;
+        buf[10] = data_.unlocked;
+        buf[11] = data_.flags;
+        buf[12] = data_.q_count & 0xFF;
+        buf[13] = data_.q_count >> 8;
+        buf[14] = data_.a_count & 0xFF;
+        buf[15] = data_.a_count >> 8;
+        buf[16] = data_.pulse_count & 0xFF;
+        buf[17] = data_.pulse_count >> 8;
+        buf[18] = data_.bad_cs;
+        buf[19] = data_.interval_x10;
+        telemetry_->setValue(buf, sizeof(buf));
+        telemetry_->notify();
+
+        // 有新帧才推, 否则手机侧不用被无意义的通知打扰
+        if (frameSeq_ != lastFrameSeq_) {
+            lastFrameSeq_ = frameSeq_;
+            size_t off = 0;
+            while (off < frameLen_) {
+                size_t n = frameLen_ - off;
+                if (n > BLE_MAX_NOTIFY_LEN) n = BLE_MAX_NOTIFY_LEN;
+                frame_->setValue((uint8_t*)frameBuf_ + off, n);
+                frame_->notify();
+                off += n;
+            }
+        }
+
+        sendBattery();
+    }
+
+private:
+    // 一条电池消息按 BLE_BMSG_PAYLOAD_MAX 切块, 每块带 [类型][片号][总片数] 头
+    void sendBatteryMsg(uint8_t type, const uint8_t* payload, size_t len) {
+        size_t total = (len + BLE_BMSG_PAYLOAD_MAX - 1) / BLE_BMSG_PAYLOAD_MAX;
+        if (total == 0) return;
+        uint8_t chunk[BLE_BMSG_CHUNK_MAX];
+        for (size_t i = 0; i < total; i++) {
+            size_t n = bleBatteryPackChunk(type, payload, len, (uint8_t)i, chunk);
+            if (n == 0) break;
+            battery_->setValue(chunk, n);
+            battery_->notify();
+        }
+    }
+
+    static uint16_t hashBytes(const uint8_t* p, size_t n) {
+        uint16_t h = 0x1D0F;
+        for (size_t i = 0; i < n; i++) h = (uint16_t)((h * 31) ^ p[i]);
+        return h;
+    }
+
+    void sendBattery() {
+        if (bms_.hasStatus) {
+            uint8_t p[BLE_BMSG_STATUS_LEN];
+            size_t n = bleBatteryPackStatus(&bms_, p);
+            sendBatteryMsg(BLE_BMSG_STATUS, p, n);
+        }
+
+        // 单体电压: 变了才推 (13 串 = 26 字节, 要分 2 片)
+        if (bms_.hasCells) {
+            uint16_t h = hashBytes((const uint8_t*)bms_.cellMv, bms_.cellCount * 2);
+            if (h != lastCellsHash_) {
+                lastCellsHash_ = h;
+                uint8_t p[BMS_MAX_CELLS * 2];
+                size_t n = bleBatteryPackCells(&bms_, p);
+                sendBatteryMsg(BLE_BMSG_CELLS, p, n);
+            }
+        }
+
+        // 型号串: 变了才推
+        if (bms_.hasModel) {
+            uint16_t h = hashBytes((const uint8_t*)bms_.model, strlen(bms_.model));
+            if (h != lastModelHash_) {
+                lastModelHash_ = h;
+                uint8_t p[BMS_MODEL_CHARS];
+                size_t n = bleBatteryPackModel(&bms_, p);
+                sendBatteryMsg(BLE_BMSG_MODEL, p, n);
+            }
+        }
+    }
+
+private:
+    class ServerCb : public BLEServerCallbacks {
+    public:
+        explicit ServerCb(BleTelemetry* owner) : owner_(owner) {}
+        void onConnect(BLEServer* s) override {
+            owner_->handleConnect(s);
+        }
+        void onDisconnect(BLEServer* s) override {
+            owner_->handleDisconnect(s);
+        }
+    private:
+        BleTelemetry* owner_;
+    };
+
+    void handleConnect(BLEServer* s) {
+        connected_ = true;
+        Serial.println("[BLE] 手机已连接");
+        (void)s;
+    }
+
+    void handleDisconnect(BLEServer* s) {
+        (void)s;
+        connected_ = false;
+        // 单体电压/型号串是"变了才推", 但手机重连后小程序那边的状态是空的 ——
+        // 不把哈希清掉的话, 重连后这两个消息永远不会再发, 电池面板只剩状态没有单体条
+        lastCellsHash_ = 0;
+        lastModelHash_ = 0;
+        Serial.println("[BLE] 手机断开, 稍后重新广播");
+        advRestartAt_ = millis() + 300;
+    }
+
+    ServerCb serverCb_;
+    BLECharacteristic* telemetry_ = nullptr;
+    BLECharacteristic* frame_ = nullptr;
+    BLECharacteristic* battery_ = nullptr;
+    BleTelemetryData data_ = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    BmsInfo bms_ = {0};
+    uint16_t lastCellsHash_ = 0;
+    uint16_t lastModelHash_ = 0;
+    bool connected_ = false;
+    unsigned long lastNotify_ = 0;
+    unsigned long advRestartAt_ = 0;
+    unsigned long lastDisconnectAt_ = 0;
+    uint8_t frameBuf_[64];
+    size_t frameLen_ = 0;
+    uint16_t frameSeq_ = 0;
+    uint16_t lastFrameSeq_ = 0;
+};
+
+#endif
