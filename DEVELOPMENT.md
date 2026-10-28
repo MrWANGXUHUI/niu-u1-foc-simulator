@@ -67,6 +67,50 @@ ESP32-C3 上**完全安全**的 GPIO 只有 **3、4、5、6、7、10** 六个。
 
 ### 4. OLED 显示
 只显示速度：大字 `km/h` + 底部 RPM / 错误码，每 200ms 刷新。
+OTA 进行中临时切成 OTA 画面（SSID + IP + 进度条），完成后恢复。
+
+### 5. OTA 升级（2026-10-27 加）
+ESP32 开 SoftAP，手机连上去，微信小程序通过局域网 HTTP 把新固件直接推进来。
+详细接口和约束见 `niu_u1_foc_simulator/NOTES.md` 第 6 节，这里只记两个决策：
+
+- **为什么是 WiFi 局域网直传**：车停楼下、车上没网，人在 10 楼。BLE 写 320KB 在 iOS 上
+  要 20 字节一片、慢到十几分钟以上且静默失败；4G 模块又太贵。而微信小程序的**局域网例外**
+  允许 `${IP}:${PORT}` 形式的 http 请求不做安全域校验 —— 于是不用备案域名、不用证书、
+  不用云开发，ESP32 也不需要公网出口。
+- **为什么固件要 base64**：Arduino WebServer 把 POST body 存成 `String(plainBuf)`，
+  按 C 字符串处理，**遇 0x00 就截断**，原始二进制必坏。base64 是纯 ASCII 才安全。
+  core 的 `base64` 只有 encode 没有 decode，所以解码器是自己写的。
+
+### 6. BLE 遥测（2026-10-28 加）
+OTA 走 WiFi 热点，手机一连热点就断网；看车速不需要断网，所以另开一条 BLE 通道：
+GATT 服务把车速/转速/电压/电流和 485 原始帧推给小程序，手机照常上网。
+
+- Arduino-ESP32 2.0.17 自带的 `BLE` 库在 C3 上能编能跑，PlatformIO 不用额外配置
+- **代价是 flash**：Bluedroid 协议栈一个人占 ~700KB，直接把分区表撑爆了（见下面分区方案）
+- **坑**：断连后不能在自己的回调里重启广播（会被静默丢掉，设备就再也扫不到了），
+  必须延后到主循环
+- **遥测载荷 20 字节**（前 12 字节是旧格式，老小程序照样能解）：车速/转速/电压/电流 +
+  485 协议车速值，外加 5 个诊断字段（V35 轮询次数、应答次数、霍尔脉冲数、校验和错帧数、
+  脉冲间隔）。骑车时看小程序就能分清「总线没通」还是「霍尔没信号」
+
+### 7. 电池 BMS 报文解析（2026-10-28 加）
+
+485 是半双工总线，所有节点都能听到别人说的话。V35 问 BMS「电量多少」时，
+BMS 的应答我们在旁边也收得到 —— 于是把它解析出来推给小程序。
+
+**为什么不冒充 BMS**：冒充的话 V35 会把我们当电池，电池信息就成了我们自己编的；
+只听不答，拿到的是**真车电池**的数据。
+
+- 解析代码在 `src/bms_protocol.h`，**纯 C++ 不依赖 Arduino**，所以能在 PC 上编译跑测试
+- 打包代码在 `src/ble_battery_msg.h`，同样纯 C++ —— 固件和小程序两边的字节布局
+  可以用一个本机测试脚本对起来（固件打包 → 小程序解析，值必须一致）
+- 15 字节状态帧的布局来自 xzfn/scooter-repair 的分析文档，但**没有直接照抄**：
+  用该仓库 7 个真车抓包日志（2041 帧 BMS 报文）逐字段核对过，解析成功率 100%、
+  校验和 0 错，而且状态帧的总电压跟单体电压求和一致 —— 这才敢用
+
+**顺带修的分帧 bug**：原来靠 `0x16` 找帧尾，但数据区里也可能出现 `0x16`
+（明文 `0xE3` + `0x33` 混淆后正好是 `0x16`），会把一帧劈成两半。
+现在按长度字节定帧：整帧 = `6 + len + 2`。
 
 ---
 
@@ -82,18 +126,35 @@ ESP32-C3 上**完全安全**的 GPIO 只有 **3、4、5、6、7、10** 六个。
 
 > 2026-10-22：NFC（PN532）方案也一并移除 —— 驱动代码、接线文档、库依赖全部删掉，I2C 只留板载 OLED。
 
+### WiFi AP + Web 扫描页面（2026-10-20 移除 → 2026-10-27 以 OTA 用途重新引入）
+原来那套是「连车上的热点 → 网页上刷固件/看诊断」，因为 `FALLBACK_AP_MODE == 0` 时
+Web 服务器会**阻塞等 WiFi 连接最多 20 秒**，上电到 485 起步慢，所以整块删掉了。
+
+2026-10-27 重新引入 WiFi，但用途完全不同：只开 SoftAP、不连路由器、**不阻塞**，
+跑的是一个极简的 OTA HTTP 服务（`src/ota_server.h`）。刷机这件事改由微信小程序做，
+网页那套不再需要。Flash 占用从 7.5% 回到 53.3%（WiFi + WebServer + U8g2 都在里面），
+2026-10-28 加了 BLE 之后到 80.8%。
+
 ---
 
 ## 分区方案
 
+2026-10-27 改成 A/B 双槽（之前是单 `factory` 分区，**根本没有 OTA 目标分区**，没法 OTA）；
+2026-10-28 因为加 BLE 把槽从 1.5MB 扩到 1.75MB（Bluedroid 占 ~700KB，1.5MB 装不下）：
+
 ```
 nvs,      data, nvs,     0x9000,  0x5000,
-ota,      data, ota,     0xe000,  0x2000,
-app0,     app,  factory, 0x10000, 0x3E0000,  // 4MB app分区
-coredump, data, coredump,0x3F0000,0x10000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x1D0000,
+app1,     app,  ota_1,   0x1E0000, 0x1D0000,
+coredump, data, coredump,0x3B0000, 0x50000,
 ```
 
-固件当前约 300KB（移除 BLE/Web 后从 1.5MB 降下来），4MB app 分区绰绰有余。
+每槽 1.75MB，当前固件 1.58MB（80.8%），余量 ~300KB。spiffs 取消了（不存文件）。
+`Update.begin(size, U_FLASH)` 会自动挑另一个槽，不用手动选；新固件起不来就回退到旧槽。
+
+**改过分区表必须全量重刷**（`tools/flash.sh`），而且要擦掉 otadata ——
+否则 bootloader 还会照着旧的 otadata 去启动 app1。
 
 ---
 
@@ -103,15 +164,38 @@ coredump, data, coredump,0x3F0000,0x10000,
 niu/
 ├── README.md
 ├── DEVELOPMENT.md              # 本文件
+├── package.json                # 只有 miniprogram-ci 一个开发依赖
 ├── docs/                       # 设计背景 / 协议分析 / 视频提示词
 ├── diagrams/                   # 接线拓扑图
+├── miniprogram/                # 微信小程序 (OTA 客户端 + BLE 遥测)
+│   ├── app.js app.json app.wxss
+│   ├── project.config.json sitemap.json
+│   ├── pages/index/            # 固件升级页
+│   ├── pages/telemetry/        # 车辆状态页 (BLE 车速 + 电池信息)
+│   ├── utils/ota.js            # 分块上传
+│   ├── utils/firmware.js       # 取固件 (内置模块 / 微信聊天选文件)
+│   ├── utils/ble.js            # BLE 连接 + 订阅 + 电池消息分片重组
+│   ├── utils/lz.js             # 固件解压 (配套 tools/lz_pack.py)
+│   └── firmware/firmware.js    # 构建产物 (压缩+base64 固件), 不入库
+├── tools/
+│   ├── build_ota.sh            # 编译固件 + 压缩 + 打包进小程序
+│   ├── lz_pack.py              # 固件压缩 (极简 LZ77)
+│   ├── flash.sh                # 刷机 (擦 otadata + bootloader + 分区表 + app)
+│   ├── ota_push_test.sh        # curl 模拟小程序的端到端 OTA 测试
+│   └── upload_miniprogram.sh   # miniprogram-ci 上传 / 预览二维码
 └── niu_u1_foc_simulator/
     ├── platformio.ini
     ├── partitions.csv
     ├── README.md
     ├── NOTES.md                # 活文档: 接线表 / 协议 / 已知问题
     └── src/
-        └── niu_u1_foc_simulator.ino  # 主程序 (485协议 + 霍尔轮速 + OLED)
+        ├── niu_u1_foc_simulator.ino  # 主程序 (485协议 + 霍尔轮速 + OLED)
+        ├── ota_config.h              # OTA 配置
+        ├── ota_server.h              # OTA 服务端
+        ├── ble_config.h              # BLE 配置
+        ├── ble_telemetry.h           # BLE 遥测服务
+        ├── ble_battery_msg.h         # 电池信息的 BLE 打包 (纯 C++, 可本机测)
+        └── bms_protocol.h            # 电池 BMS 报文解析 (纯 C++, 可本机测)
 ```
 
 ---
@@ -125,7 +209,7 @@ TW002 的 CH340K 没把 GPIO9 (BOOT) 接到 DTR，软件复位进不了下载模
 # 2. 按住 BOOT 不放
 # 3. 插回 USB (进入下载模式)
 # 4. 立刻跑
-bash /tmp/flash_after_boot.sh
+bash tools/flash.sh /dev/ttyUSB0
 # 5. 看到 "Writing at 0x..." 进度 → 松开 BOOT
 ```
 

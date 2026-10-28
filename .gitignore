@@ -6,3 +6,9 @@ compile_commands.json
 *.map
 draft_*/
 .claude/
+node_modules/
+package-lock.json
+
+# 小程序内置固件 —— tools/build_ota.sh 的产物, 不入库
+miniprogram/firmware/firmware.js
+miniprogram-preview-qrcode.png

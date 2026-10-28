@@ -37,12 +37,77 @@
 | `0x01` `04` | `0x81` + `0x11`（固件版本） |
 | `0x06` | `0x86` + 空数据 ACK（与原厂一致） |
 
+## OTA 升级（微信小程序）
+
+车停楼下、人住 10 楼 —— 改个固件不该拆车接线再手动按 BOOT。
+
+ESP32 开一个 WiFi 热点，手机连上它，**微信小程序通过局域网 HTTP 把新固件直接推进来**。
+能这么干是因为微信小程序的「局域网例外」：`${IP}:${PORT}/${PATH}` 形式且手机与设备同网段时，
+不做安全域校验、也不用 https —— 所以不需要备案域名 / 证书 / 云开发，ESP32 也不需要公网。
+
+| 项 | 值 |
+|---|---|
+| 热点 | `NIU-U1-OTA` / `niu12345` |
+| 地址 | `http://192.168.4.1:8080` |
+
+```
+手机 (微信小程序)  ──WiFi 热点──►  ESP32-C3
+  选固件(内置/聊天)               SoftAP 192.168.4.1:8080
+  base64 分块 POST  ─────────►   /ota/begin /ota/chunk /ota/end
+  进度条 + KB/s                  Update.write → 备用槽 → 切槽重启
+```
+
+- 固件端：`niu_u1_foc_simulator/src/ota_server.h`（接口表见 [NOTES.md](niu_u1_foc_simulator/NOTES.md) 第 6 节）
+- 小程序端：`miniprogram/`
+- 端到端验证（不用手机）：`bash tools/ota_push_test.sh`
+- 上传体验版 / 预览二维码：`bash tools/upload_miniprogram.sh preview|upload`（需要 AppID + 上传私钥）
+
+> 分区表已改成 A/B 双槽（每槽 1.75MB），**必须全量重刷一次**（`tools/flash.sh`）之后 OTA 才可用。
+
+## BLE 遥测（看车速不用连 WiFi）
+
+OTA 走 WiFi 热点，手机一连热点就断网；看车速不需要断网，所以另开一条 BLE 通道：
+GATT 服务把**车速 / 转速 / 电压 / 电流 / 协议车速 / 错误码**、**总线上抓到的 485 原始帧**，
+以及**电池 BMS 的解析结果**推给小程序。
+
+- 服务 UUID `6e400001-b5a3-f393-e0a9-e50e24dcca9e`，遥测特征 `…0002`，原始帧特征 `…0003`，电池特征 `…0004`
+- 遥测 5 Hz（200ms）主动通知；原始帧按 20 字节一节推送，小程序按帧尾 `0x16` 拼回整帧
+- 固件侧：`niu_u1_foc_simulator/src/ble_telemetry.h`
+- 小程序侧：`miniprogram/pages/telemetry/`（大号车速 + 电池面板 + 485 帧滚动列表）
+
+> 微信小程序**没有自动连 WiFi 的 API**（iOS / Android 都没有），所以没法替用户点「加入热点」。
+> 小程序能做的是：连上热点后每 2 秒自动探测设备并连上，另外提供「复制热点密码」按钮一键填到系统设置里。
+> 看车速这条需求用 BLE 就完全不需要 WiFi。
+
+## 电池信息（485 总线上的 BMS 报文）
+
+485 是半双工总线，V35 问 BMS「电量多少」时我们在旁边也听得见 —— 于是把 BMS 的应答解析出来给小程序看。
+**我们不冒充 BMS、也不应答任何 BMS 请求**，只听。
+
+V35 有四种问法，BMS 回三种东西：
+
+| BMS 应答 | 内容 |
+|---|---|
+| 15 字节状态 | 总电压（大端 u16，0.1V）、电流（A）、电量（%）、5 个温度（°C） |
+| 40 字节单体电压 | 每格 2 字节 mV（大端），13 串的 48V 电池就是 13 个 ~3.7V |
+| 36 / 43 字节 | 电池型号串（16 字节 ASCII，如 `BUM9L62S43500598`） |
+
+字段布局用真车抓包日志逐字段核对过：7 个日志共 2041 帧 BMS 报文，解析成功率 100%、校验和 0 错，
+且状态帧的总电压与单体电压求和一致（48.6V vs 48.69V）。
+
+- 固件侧：`niu_u1_foc_simulator/src/bms_protocol.h`（纯 C++，可在 PC 上编译跑测试）
+- 详见 [NOTES.md](niu_u1_foc_simulator/NOTES.md) 第 6.6 节
+
+> 顺带修了个分帧 bug：原来靠 `0x16` 找帧尾，但数据区里也可能出现 `0x16`（明文 `0xE3` + `0x33` 混淆后），
+> 会把一帧劈成两半。现在改成按长度字节定帧。
+
 ## 仓库结构
 
 ```
 niu/
 ├── README.md                       # 本文件
 ├── DEVELOPMENT.md                  # 开发记录：硬件选型、历史决策、已移除功能
+├── package.json                    # 只有 miniprogram-ci 一个开发依赖
 ├── docs/
 │   ├── design_background.md        # 开发笔记（背景、需求、硬件选型）
 │   ├── protocol_analysis.md        # 协议分析（帧格式、命令详解）
@@ -51,14 +116,38 @@ niu/
 │   └── 2026-10-22T204500/
 │       ├── diagram.svg
 │       └── diagram.png
+├── miniprogram/                    # 微信小程序（OTA 客户端 + BLE 遥测）
+│   ├── pages/index/                # 固件升级页
+│   ├── pages/telemetry/            # 车辆状态页（BLE 车速 / 485 帧）
+│   ├── utils/ota.js                # 分块上传
+│   ├── utils/firmware.js           # 取固件（内置压缩模块 / 微信聊天选文件）
+│   ├── utils/ble.js                # BLE 连接 + 订阅 + 解析（含电池消息分片重组）
+│   ├── utils/lz.js                 # 固件解压（配套 tools/lz_pack.py）
+│   └── firmware/firmware.js        # 构建产物（压缩+base64 固件），不入库
+├── tools/
+│   ├── build_ota.sh                # 编译固件 + 压缩 + 打包进小程序
+│   ├── lz_pack.py                  # 固件压缩（极简 LZ77）
+│   ├── flash.sh                    # 刷机（擦 otadata + bootloader + 分区表 + app）
+│   ├── ota_push_test.sh            # curl 模拟小程序的端到端 OTA 测试
+│   └── upload_miniprogram.sh       # miniprogram-ci 上传 / 预览二维码
 └── niu_u1_foc_simulator/           # PlatformIO 工程
     ├── platformio.ini
-    ├── partitions.csv
+    ├── partitions.csv               # A/B 双槽（每槽 1.75MB）
     ├── README.md                   # 固件说明（接线、协议速查）
     ├── NOTES.md                    # 活文档：接线表 / 协议 / 已知问题，以它为准
     └── src/
-        └── niu_u1_foc_simulator.ino
+        ├── niu_u1_foc_simulator.ino
+        ├── ota_config.h            # OTA 配置（SSID/密码/IP/端口/版本号）
+        ├── ota_server.h            # OTA 服务端
+        ├── ble_config.h            # BLE 配置（名字 / UUID / 通知周期）
+        ├── ble_telemetry.h         # BLE 遥测服务（车速 + 485 帧 + 电池）
+        ├── ble_battery_msg.h       # 电池信息的 BLE 打包格式（纯 C++，可本机测）
+        └── bms_protocol.h          # 电池 BMS 报文解析（纯 C++，可本机测）
 ```
+
+> **固件为什么压缩后再 base64**：小程序主包上限 2MB，而固件加了 BLE 之后是 1.58MB，
+> 直接 base64 是 2.1MB 超限。构建时用 `tools/lz_pack.py` 压到 ~1.05MB（68%），
+> 小程序里用 `utils/lz.js` 解回原始固件再上传。
 
 ## 编译与烧录
 
@@ -72,6 +161,10 @@ pio run          # 编译
 
 > ⚠️ TW002 的 CH340K 没把 GPIO9（BOOT）接到 DTR，软件复位进不了下载模式，**必须手动按 BOOT**：
 > 拔 USB → 按住 BOOT → 插回 USB → 立刻跑烧录命令 → 看到 "Writing at 0x..." 后松开。
+
+```bash
+bash tools/flash.sh /dev/ttyUSB0   # bootloader + 分区表 + app 一次写全
+```
 
 ## 参考资料
 

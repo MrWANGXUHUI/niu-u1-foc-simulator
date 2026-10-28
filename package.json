@@ -1,0 +1,8 @@
+{
+  "name": "niu-u1-ota-tools",
+  "private": true,
+  "description": "小牛 U1 FOC 模拟器 —— 小程序上传等开发工具",
+  "devDependencies": {
+    "miniprogram-ci": "^2.1.31"
+  }
+}

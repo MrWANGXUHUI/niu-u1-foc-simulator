@@ -1,0 +1,11 @@
+{
+  "pages": ["pages/index/index", "pages/telemetry/telemetry"],
+  "window": {
+    "backgroundTextStyle": "dark",
+    "navigationBarBackgroundColor": "#16161a",
+    "navigationBarTitleText": "小牛 U1",
+    "navigationBarTextStyle": "white"
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json"
+}

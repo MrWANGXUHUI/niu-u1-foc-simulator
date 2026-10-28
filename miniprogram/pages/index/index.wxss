@@ -1,0 +1,43 @@
+.input {
+  font-size: 26rpx;
+  color: #9fd0ff;
+  text-align: right;
+  padding: 0 8rpx;
+  border-bottom: 1rpx solid #3a3a42;
+}
+
+.src-btns {
+  display: flex;
+}
+
+.src-btn {
+  font-size: 24rpx;
+  padding: 0 18rpx;
+  margin-left: 12rpx;
+  line-height: 2.2;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  margin-top: 16rpx;
+}
+
+.act {
+  font-size: 24rpx;
+  padding: 0 16rpx;
+  margin: 0 12rpx 12rpx 0;
+  line-height: 2.4;
+}
+
+.bar {
+  margin: 16rpx 0;
+}
+
+.tip {
+  margin-top: 20rpx;
+  color: #8e8e96;
+  font-size: 24rpx;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}

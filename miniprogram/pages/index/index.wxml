@@ -1,0 +1,82 @@
+<view class="card">
+  <view class="row">
+    <text class="label">设备</text>
+    <text class="value">{{statusText}}</text>
+  </view>
+  <view class="row">
+    <text class="label">IP</text>
+    <input class="value input" type="text" value="{{ip}}" bindinput="onIpInput" disabled="{{busy}}" />
+  </view>
+  <view class="row" wx:if="{{info}}">
+    <text class="label">当前版本</text>
+    <text class="value">{{info.version}}</text>
+  </view>
+  <view class="row" wx:if="{{info}}">
+    <text class="label">运行分区 / 剩余内存</text>
+    <text class="value">{{info.slot}} / {{heapText}}</text>
+  </view>
+  <view class="actions">
+    <button class="ghost act" bindtap="onProbe" disabled="{{busy}}">重新检测</button>
+    <button class="ghost act" bindtap="copyApInfo">复制热点密码</button>
+    <button class="ghost act" bindtap="goTelemetry">看车速</button>
+  </view>
+  <view class="tip" wx:if="{{!info}}">
+    微信没有"自动连 WiFi"的接口, 手机上的热点得手动连一次:\n连 <text class="mono">{{apSsid}}</text> (密码 <text class="mono">{{apPassword}}</text>), 连上以后本页会自动接上, 不用再点"重新检测".
+  </view>
+</view>
+
+<view class="card">
+  <view class="row">
+    <text class="label">固件来源</text>
+    <view class="src-btns">
+      <button class="ghost src-btn" bindtap="useBuiltin" disabled="{{busy}}">内置</button>
+      <button class="ghost src-btn" bindtap="pickFile" disabled="{{busy}}">从微信选</button>
+    </view>
+  </view>
+  <view class="row" wx:if="{{firmware}}">
+    <text class="label">文件</text>
+    <text class="value">{{firmware.name}}</text>
+  </view>
+  <view class="row" wx:if="{{firmware}}">
+    <text class="label">版本</text>
+    <text class="value">{{firmware.version}}</text>
+  </view>
+  <view class="row" wx:if="{{firmware}}">
+    <text class="label">大小</text>
+    <text class="value">{{sizeText}}</text>
+  </view>
+  <view class="row" wx:if="{{firmware.md5}}">
+    <text class="label">md5</text>
+    <text class="value mono">{{firmware.md5}}</text>
+  </view>
+</view>
+
+<view class="card" wx:if="{{busy || phaseText}}">
+  <view class="row">
+    <text class="label">{{phaseText}}</text>
+    <text class="value">{{progress}}%</text>
+  </view>
+  <progress class="bar" percent="{{progress}}" stroke-width="10" color="#1a7f37" activeColor="#1a7f37" />
+  <view class="row">
+    <text class="label">已传</text>
+    <text class="value">{{sentText}} / {{sizeText}}  {{speedText}}</text>
+  </view>
+</view>
+
+<view class="card">
+  <button class="primary" bindtap="startUpdate" disabled="{{!canUpdate}}">
+    {{busy ? '升级中…' : '开始升级'}}
+  </button>
+  <view class="tip" wx:if="{{!info}}">
+    1. 手机连接 WiFi 热点 <text class="mono">{{apSsid}}</text> (密码 {{apPassword}})
+    \n2. 页面会自己接上, 不用再点「重新检测」
+    \n3. 传输 1.5MB 大概要一分钟, 别锁屏
+  </view>
+</view>
+
+<view class="card">
+  <view class="label" style="margin-bottom:12rpx">日志</view>
+  <scroll-view class="log" scroll-y scroll-into-view="{{logAnchor}}" scroll-with-animation>
+    <view wx:for="{{logs}}" wx:key="index" id="log{{index}}" class="log-line">{{item}}</view>
+  </scroll-view>
+</view>

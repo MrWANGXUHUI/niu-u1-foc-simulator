@@ -1,0 +1,70 @@
+page {
+  background: #16161a;
+  color: #e8e8ea;
+  font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+  font-size: 28rpx;
+}
+
+.card {
+  background: #232329;
+  border-radius: 20rpx;
+  padding: 28rpx;
+  margin: 24rpx;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12rpx 0;
+}
+
+.label {
+  color: #8e8e96;
+  font-size: 26rpx;
+}
+
+.value {
+  font-size: 26rpx;
+  max-width: 60%;
+  text-align: right;
+  word-break: break-all;
+}
+
+.mono {
+  font-family: Menlo, Consolas, monospace;
+  font-size: 24rpx;
+  color: #9fd0ff;
+}
+
+button.primary {
+  background: #1a7f37;
+  color: #fff;
+  border-radius: 12rpx;
+  font-size: 30rpx;
+}
+
+button.primary[disabled] {
+  background: #2c3a31;
+  color: #6b7a70;
+}
+
+button.ghost {
+  background: #2f2f36;
+  color: #cfd3da;
+  border-radius: 12rpx;
+  font-size: 28rpx;
+}
+
+.log {
+  font-family: Menlo, Consolas, monospace;
+  font-size: 22rpx;
+  color: #7f8794;
+  line-height: 1.5;
+  height: 420rpx;
+}
+
+.log-line {
+  padding: 2rpx 0;
+  word-break: break-all;
+}
