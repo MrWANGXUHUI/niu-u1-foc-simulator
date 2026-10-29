@@ -217,16 +217,14 @@ niu/
 
 ## 烧录命令
 
-TW002 的 CH340K 没把 GPIO9 (BOOT) 接到 DTR，软件复位进不了下载模式，**必须手动按 BOOT**：
+> **2026-10-29 实测：不用手动按 BOOT 了。** esptool 的 `--before default_reset` 通过 CH340 的
+> DTR/RTS 就能自动把板子拨进下载模式，连续刷了三次都一次成功。手动按 BOOT 留作备用。
 
 ```bash
-# 1. 拔 USB
-# 2. 按住 BOOT 不放
-# 3. 插回 USB (进入下载模式)
-# 4. 立刻跑
 bash tools/flash.sh /dev/ttyUSB0
-# 5. 看到 "Writing at 0x..." 进度 → 松开 BOOT
 ```
+
+自动复位失灵时的备用流程（拔 USB → 按住 BOOT → 插回 USB → 立刻跑脚本 → 看到进度后松开）。
 
 编译（不烧录）：
 

@@ -87,7 +87,17 @@ ECU 换算: 仪表速度 = 车速值×12/25。
 
 ## 4. 刷机流程
 
-> 板子的 CH340K 没把 GPIO9 (BOOT) 接到 DTR, 软件复位进不了下载模式, **必须手动按 BOOT**
+> **2026-10-29 实测: 不用手动按 BOOT 了.** `tools/flash.sh` 用 esptool 的
+> `--before default_reset --after hard_reset`, 通过 CH340 的 DTR/RTS 就能自动把板子拨进下载模式.
+> 2026-10-29 连续刷了三次都是一次成功 (2026-10-20 那会儿记的是"必须手动按 BOOT", 现在不成立了).
+> 脚本本身还有 30 次重试, 万一自动进不去, 再按老办法手动按 BOOT 也不迟.
+
+```bash
+# 直接跑就行
+bash tools/flash.sh /dev/ttyUSB0
+```
+
+手动进下载模式的备用办法 (自动复位失灵时):
 
 ```bash
 # 1. 拔 USB
