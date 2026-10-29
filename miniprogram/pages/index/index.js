@@ -80,7 +80,9 @@ Page({
     } catch (e) {
       this.setData({ info: null, statusText: '未连接', canUpdate: false })
       if (!silent) {
-        this.log('连不上设备: ' + e.message + ' (手机连上 ' + this.data.apSsid + ' 了吗?)')
+        this.log('连不上设备: ' + e.message)
+        this.log('排查: ① 手机连上热点 ' + this.data.apSsid +
+                 '  ② iPhone 设置→微信→本地网络 打开  ③ 屏幕上的 rst: 是不是 PANIC/BROWNOUT')
       }
     }
   },

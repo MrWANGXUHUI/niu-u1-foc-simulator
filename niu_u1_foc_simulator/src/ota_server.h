@@ -50,7 +50,14 @@ public:
         IPAddress ip(OTA_AP_IP);
         WiFi.mode(WIFI_AP);
         WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0));
-        bool ok = WiFi.softAP(OTA_AP_SSID, OTA_AP_PASSWORD);
+        // 信道见 ota_config.h 的说明 —— 默认的 1 信道跟 BLE 广播信道撞车, 手机连不上
+        bool ok = WiFi.softAP(OTA_AP_SSID, OTA_AP_PASSWORD, OTA_AP_CHANNEL);
+        WiFi.setSleep(false);   // 关掉 modem sleep, 否则 AP 会时不时把客户端踢掉
+        // 发射功率从默认 19.5dBm 降到 8.5dBm.
+        // 手机就贴在车边, 功率再高也没用; 而 WiFi 满功率发射的瞬时电流能到 300mA+,
+        // 车上供电是 48V 降压下来的, 功率越小越不容易把板子拉棕断 (棕断=反复重启=
+        // 热点掉线+屏幕闪烁). 功率不够的话手机连不上, 但距离只有一两米, 8.5dBm 绰绰有余.
+        WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
         server.on("/ota/info",  HTTP_GET,  [this] { handleInfo();  });
         server.on("/ota/begin", HTTP_POST, [this] { handleBegin(); });
@@ -62,8 +69,8 @@ public:
         });
         server.begin();
 
-        Serial.printf("[OTA] 热点 %s %s  IP %s:%d\n",
-                      OTA_AP_SSID, ok ? "已启动" : "启动失败",
+        Serial.printf("[OTA] 热点 %s %s  信道%d  IP %s:%d\n",
+                      OTA_AP_SSID, ok ? "已启动" : "启动失败", OTA_AP_CHANNEL,
                       ip.toString().c_str(), OTA_HTTP_PORT);
     }
 

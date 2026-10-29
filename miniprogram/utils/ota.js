@@ -11,6 +11,28 @@ function baseUrl(ip, port) {
   return 'http://' + ip + ':' + port
 }
 
+// 把微信/iOS 的 errMsg 翻译成人能看懂、能动手解决的一句话.
+// 局域网直传最容易卡在这三个地方, 不翻译的话用户只能看到 "request:fail"
+function explainFail(errMsg) {
+  const m = (errMsg || '').toLowerCase()
+  if (m.indexOf('not in domain list') >= 0 || m.indexOf('not in domain') >= 0) {
+    return '域名/IP 不在白名单 —— 小程序后台「开发管理 → 服务器域名」要勾上「不校验合法域名」'
+  }
+  if (m.indexOf('local network') >= 0) {
+    return 'iPhone 没给小程序「本地网络」权限 —— 设置 → 微信 → 本地网络 里打开'
+  }
+  if (m.indexOf('timeout') >= 0 || m.indexOf('time out') >= 0) {
+    return '超时 —— 手机连上热点了吗? 设备在 192.168.4.1:8080 吗?'
+  }
+  if (m.indexOf('refused') >= 0) {
+    return '连接被拒 —— 设备可能刚重启, 等两秒再试'
+  }
+  if (m.indexOf('fail') >= 0 && !errMsg) {
+    return '请求失败 —— 检查手机热点连接和 iPhone 本地网络权限'
+  }
+  return errMsg || '请求失败'
+}
+
 function request(url, options) {
   return new Promise((resolve, reject) => {
     wx.request({
@@ -26,7 +48,7 @@ function request(url, options) {
         }
       },
       fail: (err) => {
-        reject(new Error(err.errMsg || '请求失败'))
+        reject(new Error(explainFail(err.errMsg)))
       },
     })
   })

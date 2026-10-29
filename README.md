@@ -13,7 +13,7 @@
 | 主控 | 天问 Pro TW002（ESP32-C3-DevKitC-02，4MB Flash，CH340K） |
 | 显示 | 板载 OLED（SSD1306 128×64，I2C GPIO5/6，地址 0x3C） |
 | 485 | MAX485 自动收发型模块（DI=GPIO7 / RO=GPIO4），接原车 A/B 差分线 |
-| 调试 | USB CDC（`Serial`，115200 8N1），与 485 完全隔离 |
+| 调试 | UART0（`Serial`，115200 8N1，经板载 CH340），与 485 完全隔离 |
 | 轮速 | 霍尔 A3144 / SSR14Y（GPIO3，`INPUT_PULLUP` + 下降沿中断）+ 单个磁铁（脉冲间隔测速，轮周长 1.28 m）|
 | 轮胎 | 16x2.50/64-305，实测周长 **1.28 m** |
 

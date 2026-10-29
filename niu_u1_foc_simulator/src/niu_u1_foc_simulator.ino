@@ -5,8 +5,17 @@
 
 #include <HardwareSerial.h>
 #include <esp_log.h>
+#include <esp_system.h>
+
+// u8g2 每传一页都会调一次 Wire.setClock(), 而 u8g2 内部定的时钟是 100kHz ——
+// 不定义这个宏的话, 我们自己设的 400kHz 每次都会被它改回 100kHz.
+#define U8X8_DO_NOT_SET_WIRE_CLOCK
 #include <U8g2lib.h>
 #include <Wire.h>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 #include "ota_config.h"
 #include "ota_server.h"
@@ -54,11 +63,11 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_MIRROR, /* reset=*/ U8X8_PIN_NONE)
 #define TEST_485_ENABLE      0
 #define TEST_485_INTERVAL_MS 1000
 
-// 调试开关: 从 USB CDC 往 485 解析链路里塞一帧 —— 车不在手边时也能验 BMS 解析.
+// 调试开关: 从调试口 (UART0/CH340) 往 485 解析链路里塞一帧 —— 车不在手边时也能验 BMS 解析.
 // 在串口里敲 "[TX] 68 31 CE 68 82 0F ... 16" 回车即可 (只认 [TX] 开头的行).
 #define DEBUG_INJECT_485     1
 
-// 485 收发的调试回显 (镜像到 USB CDC). 关掉可以省掉 USB 上的开销,
+// 485 收发的调试回显 (镜像到调试口). 关掉可以省掉串口上的开销,
 // 车上跑的时候 USB 一般没插, 回显写进环形缓冲区就丢了, 不影响应答时序.
 #define DEBUG_485_ECHO       1
 
@@ -317,8 +326,8 @@ private:
         serial->write(frame, idx);
         serial->flush();
 #if DEBUG_485_ECHO
-        // 调试回显：镜像到 USB CDC (独立通道，不污染 485).
-        // 刻意不调 Serial.flush() —— USB 接上电脑时 flush 最长阻塞 100ms,
+        // 调试回显：镜像到调试口 (独立通道，不污染 485).
+        // 刻意不调 Serial.flush() —— 电脑接上但没人读时, 串口 TX 会堵住,
         // 而 V35 的单次轮询超时只有 ~20ms, 卡一次这一轮就黄了.
         Serial.printf("[485→] ");
         for (size_t i = 0; i < idx; i++) Serial.printf("%02X ", frame[i]);
@@ -573,10 +582,165 @@ static void rxPush(uint8_t c) {
     }
 }
 
+// ============ OLED 显示 ============
+// 显示放到独立任务里跑, 原因很硬:
+// 一屏 1024 字节, 100kHz 下要传 ~95ms. 要是放在 loop 里画, 这 95ms 里 loop 完全动不了 ——
+// 而 V35 单次轮询的超时只有 ~20ms, 撞上了就是"这一轮没应答 → 错误码 190 → 车速 0",
+// 也就是"有时候没有速度". 挪到独立任务后, I2C 传输期间 loop 照样跑, 应答只晚 ~1ms.
+#define OLED_TASK_STACK 4096
+#define OLED_TASK_PRIO  1      // 跟 Arduino 的 loop 任务同级, 靠时间片轮转
+#define OLED_REFRESH_MS 200
+#define OLED_I2C_HZ     400000  // SSD1306 支持 400kHz, 传输时间从 95ms 降到 ~25ms
+// 1 = 每 200ms 无条件重画屏幕 (测"显示满负荷时 485 应答还准不准"用)
+#define OLED_FORCE_REDRAW 0
+
+// 显示用的数据快照 —— loop 任务写, OLED 任务读, 用互斥量保护
+struct DispState {
+    uint16_t speed_dm;   // 车速 ×10
+    uint16_t rpm;
+    uint8_t  error;
+    uint8_t  soc;        // 0xFF = 还没拿到电池数据
+    uint8_t  unlocked;
+};
+static DispState disp_state = {0, 0, 0, 0xFF, 0};
+static SemaphoreHandle_t disp_lock = nullptr;
+
+// 开机画面要显示复位原因 —— 车上如果是在棕断/看门狗复位, 这里一眼能看出来
+static const char* g_rst_reason = "?";
+static uint32_t g_boot_ms = 0;
+
+// 只显示速度: 大字 km/h + 底部 RPM / 错误码
+// (不把 DispState 写进参数里: .ino 的原型生成器会把函数原型插到文件最前面,
+//  那时候这个结构体还没定义, 编译不过. 所以这里直接读全局快照.)
+void drawOled() {
+    DispState s;
+    if (!disp_lock || xSemaphoreTake(disp_lock, portMAX_DELAY) != pdTRUE) return;
+    s = disp_state;
+    xSemaphoreGive(disp_lock);
+
+    u8g2.clearBuffer();
+    u8g2.setDrawColor(1);
+
+    // 大字车速 (十分位整数 → "23.4")
+    char spd[16];
+    snprintf(spd, sizeof(spd), "%u.%u", s.speed_dm / 10, s.speed_dm % 10);
+    u8g2.setFont(u8g2_font_ncenB14_te);
+    int w = u8g2.getStrWidth(spd);
+    u8g2.setCursor((128 - w) / 2, 34);
+    u8g2.print(spd);
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.setCursor((128 - w) / 2 + w + 4, 24);
+    u8g2.print("km/h");
+
+    // 复位原因 —— 常驻显示. 车上要是"屏幕一会亮一会不亮",
+    // 那多半是板子在反复复位 (棕断/看门狗/panic), 这一行直接告诉你上次是怎么挂的.
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.setCursor(0, 43);
+    u8g2.printf("rst:%s", g_rst_reason);
+
+    // 底部: 电量 + RPM + 错误码
+    char bottom[32];
+    if (s.soc != 0xFF) {
+        snprintf(bottom, sizeof(bottom), "%d%%  %d RPM", s.soc, (int)s.rpm);
+    } else {
+        snprintf(bottom, sizeof(bottom), "%d RPM", (int)s.rpm);
+    }
+    u8g2.setCursor(0, 55);
+    u8g2.print(bottom);
+    if (s.error != 0) {
+        char err[8];
+        snprintf(err, sizeof(err), "ERR%02X", s.error);
+        w = u8g2.getStrWidth(err);
+        u8g2.setCursor(128 - w, 55);
+        u8g2.print(err);
+    }
+
+    u8g2.sendBuffer();
+}
+
+// 开机画面: 版本 + 复位原因 + 热点地址
+void drawOledBoot() {
+    u8g2.clearBuffer();
+    u8g2.setDrawColor(1);
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.setCursor(0, 4);
+    u8g2.printf("NIU-U1 FOC  v%s", OTA_FW_VERSION);
+    u8g2.setCursor(0, 18);
+    u8g2.printf("rst: %s", g_rst_reason);
+    u8g2.setCursor(0, 30);
+    u8g2.printf("ap: %s", OTA_AP_SSID);
+    u8g2.setCursor(0, 42);
+    u8g2.printf("ip: %s", WiFi.softAPIP().toString().c_str());
+    u8g2.sendBuffer();
+}
+
+// OTA 传输中抢下屏幕: 显示热点名/IP/进度, 让人一眼知道在干嘛
+void drawOledOta() {
+    u8g2.clearBuffer();
+    u8g2.setDrawColor(1);
+    u8g2.setFont(u8g2_font_6x10_tf);
+
+    u8g2.setCursor(0, 2);
+    u8g2.printf("OTA  %s", OTA_AP_SSID);
+
+    u8g2.setCursor(0, 14);
+    u8g2.printf("IP %s:%d", WiFi.softAPIP().toString().c_str(), OTA_HTTP_PORT);
+
+    // 进度条
+    uint32_t total = otaService.total();
+    uint32_t cur = otaService.progress();
+    u8g2.drawFrame(0, 24, 128, 12);
+    int w = total ? (int)((124 * (uint32_t)cur) / total) : 0;
+    if (w > 0) u8g2.drawBox(2, 26, w, 8);
+
+    u8g2.setCursor(0, 40);
+    u8g2.printf("%u/%u KB  %d%%", cur / 1024, total / 1024,
+                total ? (int)((uint32_t)cur * 100 / total) : 0);
+
+    u8g2.setCursor(0, 52);
+    u8g2.print("keep this page open");
+
+    u8g2.sendBuffer();
+}
+
+// OLED 任务 —— 只碰 u8g2 和自己那份快照
+void oledTask(void* arg) {
+    DispState last = {0xFFFF, 0xFFFF, 0xFF, 0xFE, 0xFF};   // 强制第一次一定画
+    unsigned long lastLog = 0;
+    for (;;) {
+        DispState s = last;
+        if (xSemaphoreTake(disp_lock, portMAX_DELAY) == pdTRUE) {
+            s = disp_state;
+            xSemaphoreGive(disp_lock);
+        }
+
+        unsigned long t0 = micros();
+        bool drew = false;
+        if (millis() - g_boot_ms < 2500) {
+            drawOledBoot();
+            drew = true;
+        } else if (otaService.isBusy()) {
+            drawOledOta();
+            drew = true;
+        } else if (memcmp(&s, &last, sizeof(s)) != 0 || OLED_FORCE_REDRAW) {
+            drawOled();   // 内容变了才重画 (省掉一次 1KB 的 I2C 传输)
+            drew = true;
+        }
+        last = s;
+        if (drew && millis() - lastLog > 5000) {
+            lastLog = millis();
+            Serial.printf("[OLED] 刷屏耗时 %lu ms (I2C %d kHz)\n",
+                          (unsigned long)((micros() - t0) / 1000), OLED_I2C_HZ / 1000);
+        }
+        vTaskDelay(pdMS_TO_TICKS(OLED_REFRESH_MS));
+    }
+}
+
 void setup() {
     disableLoopWDT();
 
-    // USB CDC (调试日志) - platformio.ini 里 CDC_ON_BOOT=1
+    // 调试日志走 UART0 (板载 CH340) —— 注意 platformio.ini 里的 CDC_ON_BOOT=1 对 C3 无效,
+    // core 只认 ARDUINO_USB_CDC_ON_BOOT, 所以 Serial 就是 UART0
     // 独立于 485 总线, 调试 ASCII 不会污染 V35 总线
     Serial.begin(115200);
     delay(100);  // 等 USB 枚举
@@ -585,9 +749,12 @@ void setup() {
 
     // Wire 必须最早初始化 — 让 FreeRTOS mutex 和 ESP-IDF I2C0 driver 在最早可用时就绪,
     // 否则 u8g2 首次传输时 I2C0 driver 还没就绪, 会刷 "could not acquire lock" +
-    // "NULL TX buffer pointer" 错误 (u8g2 每页传输前都调 Wire.setClock()).
+    // "NULL TX buffer pointer" 错误.
+    // 时钟用 400kHz: 一屏 1024 字节, 100kHz 要 95ms, 400kHz 只要 ~25ms.
+    // 注意 u8g2 自己会调 Wire.setClock(100000) 把时钟改回去 —— 靠文件顶部的
+    // U8X8_DO_NOT_SET_WIRE_CLOCK 关掉它.
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-    Wire.setClock(100000);
+    Wire.setClock(OLED_I2C_HZ);
 
     // 485 总线 (V35 ECU 通信) - 9600 8E1, GPIO4=RX / GPIO7=TX, 自动收发模块
     // GPIO2/8/9 是 strapping pin, GPIO11-17/18/19/20/21 被 flash/USB/UART0 占用,
@@ -626,6 +793,26 @@ void setup() {
     u8g2.begin();
     Serial.print("[OLED] 初始化完成\n"); Serial.flush();
 
+    // 复位原因 —— 车上要是莫名其妙重启, 这一行直接告诉我们是棕断还是看门狗
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:   g_rst_reason = "POWERON"; break;
+        case ESP_RST_EXT:       g_rst_reason = "EXT"; break;
+        case ESP_RST_SW:        g_rst_reason = "SW"; break;
+        case ESP_RST_PANIC:     g_rst_reason = "PANIC"; break;
+        case ESP_RST_INT_WDT:   g_rst_reason = "INT_WDT"; break;
+        case ESP_RST_TASK_WDT:  g_rst_reason = "TASK_WDT"; break;
+        case ESP_RST_WDT:       g_rst_reason = "WDT"; break;
+        case ESP_RST_BROWNOUT:  g_rst_reason = "BROWNOUT"; break;
+        case ESP_RST_DEEPSLEEP: g_rst_reason = "DEEPSLEEP"; break;
+        default:                g_rst_reason = "UNKNOWN"; break;
+    }
+    g_boot_ms = millis();
+    Serial.printf("[BOOT] 复位原因: %s\n", g_rst_reason); Serial.flush();
+
+    // 显示任务 —— 独立跑, 不占 485 应答的时间
+    disp_lock = xSemaphoreCreateMutex();
+    xTaskCreate(oledTask, "oled", OLED_TASK_STACK, nullptr, OLED_TASK_PRIO, nullptr);
+
     Serial.printf("[MEM] free=%d\n", esp_get_free_heap_size()); Serial.flush();
 
 #if OTA_AP_ENABLE
@@ -643,75 +830,9 @@ void setup() {
     Serial.print("[READY] 等待 V35 ECU 轮询\n"); Serial.flush();
 }
 
-// 只显示速度: 大字 km/h + 底部 RPM / 错误码
-void drawOled() {
-    u8g2.clearBuffer();
-    u8g2.setDrawColor(1);
-
-    // 大字车速 (十分位整数 → "23.4")
-    char spd[16];
-    snprintf(spd, sizeof(spd), "%u.%u",
-             foc_status.wheel_speed_dm / 10, foc_status.wheel_speed_dm % 10);
-    u8g2.setFont(u8g2_font_ncenB14_te);
-    int w = u8g2.getStrWidth(spd);
-    u8g2.setCursor((128 - w) / 2, 34);
-    u8g2.print(spd);
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.setCursor((128 - w) / 2 + w + 4, 24);
-    u8g2.print("km/h");
-
-    // 底部: 电量 + RPM + 错误码
-    char bottom[32];
-    if (bms_info.hasStatus) {
-        snprintf(bottom, sizeof(bottom), "%d%%  %d RPM", bms_info.soc, (int)foc_status.wheel_rpm);
-    } else {
-        snprintf(bottom, sizeof(bottom), "%d RPM", (int)foc_status.wheel_rpm);
-    }
-    u8g2.setCursor(0, 55);
-    u8g2.print(bottom);
-    if (foc_status.error != 0) {
-        char err[8];
-        snprintf(err, sizeof(err), "ERR%02X", foc_status.error);
-        w = u8g2.getStrWidth(err);
-        u8g2.setCursor(128 - w, 55);
-        u8g2.print(err);
-    }
-
-    u8g2.sendBuffer();
-}
-
-// OTA 传输中抢下屏幕: 显示热点名/IP/进度, 让人一眼知道在干嘛
-void drawOledOta() {
-    u8g2.clearBuffer();
-    u8g2.setDrawColor(1);
-    u8g2.setFont(u8g2_font_6x10_tf);
-
-    u8g2.setCursor(0, 2);
-    u8g2.printf("OTA  %s", OTA_AP_SSID);
-
-    u8g2.setCursor(0, 14);
-    u8g2.printf("IP %s:%d", WiFi.softAPIP().toString().c_str(), OTA_HTTP_PORT);
-
-    // 进度条
-    uint32_t total = otaService.total();
-    uint32_t cur = otaService.progress();
-    u8g2.drawFrame(0, 24, 128, 12);
-    int w = total ? (int)((124 * (uint32_t)cur) / total) : 0;
-    if (w > 0) u8g2.drawBox(2, 26, w, 8);
-
-    u8g2.setCursor(0, 40);
-    u8g2.printf("%u/%u KB  %d%%", cur / 1024, total / 1024,
-                total ? (int)((uint32_t)cur * 100 / total) : 0);
-
-    u8g2.setCursor(0, 52);
-    u8g2.print("keep this page open");
-
-    u8g2.sendBuffer();
-}
-
 void loop() {
 #if DEBUG_INJECT_485
-    // 调试用: USB CDC 上敲 "[TX] 68 31 CE ... 16" 回车, 把字节喂进 485 解析链路.
+    // 调试用: 在调试口敲 "[TX] 68 31 CE ... 16" 回车, 把字节喂进 485 解析链路.
     // 没有车的时候也能验 BMS 解析 —— 但只认 [TX] 开头的行, 免得误敲的字符被当成帧.
     while (Serial.available()) {
         int c = Serial.read();
@@ -812,17 +933,20 @@ void loop() {
     }
 
     static unsigned long lastOledUpdate = 0;
-    if (millis() - lastOledUpdate > 200) {
-#if OTA_AP_ENABLE
-        if (otaService.isBusy()) {
-            drawOledOta();
-        } else {
-            drawOled();
-        }
-#else
-        drawOled();
-#endif
+    if (millis() - lastOledUpdate > 100) {
         lastOledUpdate = millis();
+        // 只更新快照, 画屏交给 OLED 任务 —— 这里绝不能被 25ms 的 I2C 传输堵住
+        DispState s = {
+            foc_status.wheel_speed_dm,
+            foc_status.wheel_rpm,
+            foc_status.error,
+            bms_info.hasStatus ? (uint8_t)bms_info.soc : (uint8_t)0xFF,
+            (uint8_t)foc_status.unlocked,
+        };
+        if (disp_lock && xSemaphoreTake(disp_lock, portMAX_DELAY) == pdTRUE) {
+            disp_state = s;
+            xSemaphoreGive(disp_lock);
+        }
     }
 
     if (millis() - last_debug > 3000) {
@@ -845,7 +969,13 @@ void loop() {
         Serial.printf("[485] 查询:%u 应答:%u 其它:%u 校验错:%u | 协议车速:%u\n",
             simulator.q_count, simulator.a_count, simulator.oth, simulator.bad_cs,
             foc_status.foc_speed);
-        // 刻意不 flush —— USB 接上电脑但没人读时, flush 会卡住主循环最多 100ms,
+#if OTA_AP_ENABLE
+        // 热点状态 —— 排查"手机连不上热点"时看这一行:
+        // 客户端数一直是 0 = 手机压根没关联上 (不是 HTTP 层的问题)
+        Serial.printf("[AP] %s 信道%d 客户端:%d\n",
+            OTA_AP_SSID, (int)WiFi.channel(), (int)WiFi.softAPgetStationNum());
+#endif
+        // 刻意不 flush —— 电脑接上但没人读时, 串口 TX 缓冲会堵住主循环,
         // 而 V35 的轮询超时只有 ~20ms, 卡一次这一轮就变成"没应答→错误码190→车速0"
         last_debug = millis();
     }

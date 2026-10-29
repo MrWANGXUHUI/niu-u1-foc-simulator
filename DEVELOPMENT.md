@@ -18,11 +18,16 @@
 | 主控 | 天问 Pro TW002 (ESP32-C3-DevKitC-02, **4MB Flash**) |
 | 显示 | 0.96寸 OLED (SSD1306, 128×64, I2C GPIO5/6, 板载) |
 | **485 通信** | **Serial1 (9600 8E1, GPIO7=TX / GPIO4=RX)** 连接 V35 ECU (地址 0x40) |
-| **调试日志** | **USB CDC (Serial, 115200 8N1)** — 仅 ASCII 文本，独立通道 |
+| **调试日志** | **UART0 (Serial, 115200 8N1, 经板载 CH340)** — 仅 ASCII 文本，独立通道 |
 | 轮速 | 霍尔传感器 A3144/SSR14Y (GPIO3, 1 磁钢) + 轮胎 16x2.50/64-305 (周长 1.28m) |
 
-> **串口完全隔离：** `platformio.ini` 里 `CDC_ON_BOOT=1` 启用 USB CDC。代码里所有 `Serial.printf` 走 USB，
-> 所有 `Serial1.*` 只用于 485 帧收发，互不干扰。
+> **串口完全隔离：** 代码里所有 `Serial.printf` 走 UART0，所有 `Serial1.*` 只用于 485 帧收发，互不干扰。
+>
+> ⚠️ **调试口是 UART0，不是原生 USB CDC。** `platformio.ini` 里的 `-DCDC_ON_BOOT=1` 对 ESP32-C3 **无效** ——
+> core 2.0.17 只认 `ARDUINO_USB_CDC_ON_BOOT`（默认 0），认错了宏 `Serial` 就还是 UART0。
+> 现状是好的：TW002 板载 CH340 正好接在 UART0（GPIO20/21）上，插 USB 就能看到日志，
+> 而且 **UART0 的 TX 不会像原生 USB 那样在"没人读"时长时间阻塞**。
+> 想改成原生 USB 得把宏换成 `-DARDUINO_USB_CDC_ON_BOOT=1`，届时 `Serial.flush()` 的阻塞风险要重新评估。
 >
 > **Serial1 引脚为何不选 GPIO20/21：** ESP-IDF 启动日志系统会把 UART0 初始化在 GPIO20/21，
 > Serial1 (UART1) 再去抢同一对引脚会导致 driver 死锁。
@@ -134,6 +139,16 @@ Web 服务器会**阻塞等 WiFi 连接最多 20 秒**，上电到 485 起步慢
 跑的是一个极简的 OTA HTTP 服务（`src/ota_server.h`）。刷机这件事改由微信小程序做，
 网页那套不再需要。Flash 占用从 7.5% 回到 53.3%（WiFi + WebServer + U8g2 都在里面），
 2026-10-28 加了 BLE 之后到 80.8%。
+
+**2026-10-29 两个关键调整**（都是「车上 WiFi 连不上 + 屏幕闪烁」逼出来的）：
+
+- **热点信道必须是 11，不能用默认的 1** —— BLE 广播固定占 37/38/39（2402/2426/2428MHz），
+  WiFi 默认信道 1（2412MHz）正好压在 37 上，共存时手机能扫到热点却连不上。信道 11（2452MHz）最安全。
+  发射功率也从 19.5dBm 降到 8.5dBm（手机就贴在车边，功率小一点省电、也不容易把板子拉棕断）。
+- **OLED 画屏必须跑在独立 FreeRTOS 任务里**，不能放 `loop()` —— 一屏 1024 字节在 100kHz 下
+  要 95ms，放 loop 里会把 485 应答和 WebServer 一起饿死（→ 车速 0 + 错误码 190 + 手机发不出请求）。
+  I2C 提到 400kHz（→ ~25ms），并 `#define U8X8_DO_NOT_SET_WIRE_CLOCK` 挡住 u8g2 把时钟改回 100kHz。
+  详见 `niu_u1_foc_simulator/NOTES.md` §5.0 和 §7.2。
 
 ---
 
