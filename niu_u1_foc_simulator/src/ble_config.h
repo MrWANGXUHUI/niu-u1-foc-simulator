@@ -9,8 +9,9 @@
 #define BLE_CONFIG_H
 
 #define BLE_ENABLE          1
-// 名字出现在手机蓝牙列表里, 小程序按这个名字找设备
-#define BLE_DEVICE_NAME     "NIU-U1-OTA"
+// 名字出现在手机蓝牙列表里, 小程序按这个前缀找设备 (小程序那边是 'NIU-U1')
+// 故意跟 WiFi 热点名 (NIU-U1-OTA) 区分开 —— 同名的话在手机蓝牙列表里分不清哪个是哪个
+#define BLE_DEVICE_NAME     "NIU-U1-BLE"
 // 沿用 Nordic UART 的 UUID 段, 免得跟别的 app 撞车
 #define BLE_SERVICE_UUID    "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define BLE_TELEMETRY_UUID  "6e400002-b5a3-f393-e0a9-e50e24dcca9e"

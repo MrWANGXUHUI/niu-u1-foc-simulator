@@ -18,6 +18,31 @@ const BMSG_STATUS = 1
 const BMSG_CELLS = 2
 const BMSG_MODEL = 3
 
+// 把微信的 errMsg 翻译成人能动手解决的一句话.
+// BLE 这边最容易卡在权限上, 不翻译的话用户只看到 "openBluetoothAdapter:fail user deny"
+function explainBleFail(errMsg, apiName) {
+  const m = (errMsg || '').toLowerCase()
+  if (m.indexOf('user deny') >= 0 || m.indexOf('user denied') >= 0 ||
+      m.indexOf('denied') >= 0 || m.indexOf('not authorized') >= 0) {
+    return '蓝牙权限被拒 —— iPhone 上到 设置 → 隐私与安全性 → 蓝牙 → 微信 打开; ' +
+           '安卓上到 设置 → 应用 → 微信 → 权限 里开蓝牙(和定位)'
+  }
+  if (m.indexOf('adapter not ready') >= 0 || m.indexOf('no bluetooth adapter') >= 0 ||
+      m.indexOf('bluetooth adapter') >= 0) {
+    return '蓝牙没开 —— 把手机蓝牙打开再试'
+  }
+  if (m.indexOf('timeout') >= 0 || m.indexOf('time out') >= 0) {
+    return '超时 —— 设备离手机太远, 或者已经被别的 App 连上了'
+  }
+  if (m.indexOf('not found') >= 0) {
+    return '设备不存在 —— 蓝牙名是 NIU-U1-BLE (WiFi 热点才叫 NIU-U1-OTA), 确认 ESP32 通着电'
+  }
+  if (m.indexOf('already connected') >= 0) {
+    return '设备已经被连上了 —— 先断掉别的 App 再试'
+  }
+  return (errMsg || (apiName + ' 失败'))
+}
+
 // wx.* 的 Promise 化包装
 function call(name, options) {
   return new Promise((resolve, reject) => {
@@ -29,7 +54,7 @@ function call(name, options) {
     fn({
       ...options,
       success: resolve,
-      fail: (err) => reject(new Error((err && err.errMsg) || name + ' 失败')),
+      fail: (err) => reject(new Error(explainBleFail(err && err.errMsg, name))),
     })
   })
 }
@@ -47,11 +72,13 @@ function discover(timeoutMs) {
   return new Promise((resolve, reject) => {
     let done = false
     const found = {}
+    const seen = {}   // 扫到的所有设备 (不管名字对不对) —— 用来在失败时说明到底扫到了什么
 
     const onFound = (res) => {
       const list = (res && res.devices) || []
       for (const d of list) {
         const name = d.name || d.localName || ''
+        seen[d.deviceId] = name || '(名字为空)'
         if (!name || name.indexOf(NAME_PREFIX) !== 0) continue
         found[d.deviceId] = { deviceId: d.deviceId, name: name, rssi: d.RSSI }
       }
@@ -65,9 +92,20 @@ function discover(timeoutMs) {
       wx.offBluetoothDevicesFound && wx.offBluetoothDevicesFound(onFound)
       call('stopBluetoothDevicesDiscovery', {}).catch(() => {})
       const list = Object.keys(found).map((k) => found[k])
-      if (list.length) resolve(list)
-      else reject(new Error('没扫到设备, 确认 ESP32 开着, 并且允许了定位权限'))
-    }, timeoutMs || 6000)
+      if (list.length) {
+        resolve(list)
+        return
+      }
+      // 一个都没匹配上 —— 把实际扫到的名字列出来, 一眼就能看出是"权限没给"还是"名字变了"
+      const names = Object.keys(seen).map((k) => seen[k])
+      if (names.length) {
+        reject(new Error('扫到了 ' + names.length + ' 个蓝牙设备但没一个叫 ' + NAME_PREFIX +
+          ' 开头的: ' + names.slice(0, 5).join(', ')))
+      } else {
+        reject(new Error('一个蓝牙设备都没扫到 —— 检查手机蓝牙是否开着, ' +
+          '微信有没有蓝牙权限 (设置→隐私与安全性→蓝牙→微信), 安卓还要给定位权限'))
+      }
+    }, timeoutMs || 8000)
 
     wx.startBluetoothDevicesDiscovery({
       services: [],
@@ -79,7 +117,7 @@ function discover(timeoutMs) {
         done = true
         clearTimeout(timer)
         wx.offBluetoothDevicesFound && wx.offBluetoothDevicesFound(onFound)
-        reject(new Error((err && err.errMsg) || '开始扫描失败'))
+        reject(new Error(explainBleFail(err && err.errMsg, '开始扫描')))
       },
     })
   })
