@@ -93,9 +93,25 @@ public:
 
         svc->start();
 
+        // 广播包布局很关键 (踩过坑):
+        //   库默认行为是「128 位 UUID + 名字 + txpower 全塞扫描回应, 主广播包只有 Flags」
+        //   —— 扫描回应只有手机主动发 SCAN_REQ 才收得到 (主动扫描). iPhone 后台的小程序
+        //   用的是被动扫描, 收不到扫描回应, 看到的就是"一个没名字的设备", 直接被名字
+        //   过滤掉了. 所以必须用自定义广播包: 名字放主广播包 (所有扫描都收得到),
+        //   128 位 UUID 放扫描回应 (连接前用不上, 连接时靠逐个特征枚举).
         BLEAdvertising* adv = BLEDevice::getAdvertising();
-        adv->addServiceUUID(BLE_SERVICE_UUID);
-        adv->setScanResponse(true);   // 128 位 UUID 放扫描回应里, 广播包放名字
+        BLEAdvertisementData advData;
+        advData.setFlags(0x06);                       // LE General Discovery + BR/EDR 不支持
+        advData.setName(BLE_DEVICE_NAME);             // 名字必须在主广播包里!
+        adv->setAdvertisementData(advData);
+
+        BLEAdvertisementData scanRsp;
+        scanRsp.setFlags(0x06);
+        scanRsp.setName(BLE_DEVICE_NAME);
+        // 128 位 UUID 放不进扫描回应 (flags 3 + 名字 12 + UUID 18 = 33 > 31 上限,
+        // addData 会静默丢弃), 干脆不放 —— 连接后靠服务枚举就够了, 小程序也不按 UUID 过滤
+        adv->setScanResponseData(scanRsp);
+        adv->setScanResponse(false);   // 不再让库自动拼扫描回应, 上面那份就是
         adv->start();
 
         connected_ = false;

@@ -109,8 +109,9 @@ function discover(timeoutMs) {
 
     wx.startBluetoothDevicesDiscovery({
       services: [],
+      // interval 拉长——iOS 上扫描回应合并进结果有延迟, 扫得太密反而漏名字
       allowDuplicatesKey: true,
-      interval: 500,
+      interval: 1000,
       success: () => {},
       fail: (err) => {
         if (done) return

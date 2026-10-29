@@ -148,7 +148,7 @@ Page({
     this.setData({ busy: true, statusText: '正在搜索设备…', frames: [] })
     try {
       await ble.openAdapter()
-      const devices = await ble.discover(6000)
+      const devices = await ble.discover(10000)
       const dev = devices[0]
       this.setData({ deviceName: dev.name, statusText: '正在连接 ' + dev.name + ' …' })
       await ble.connect(dev.deviceId)
