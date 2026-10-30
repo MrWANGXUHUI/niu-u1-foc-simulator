@@ -20,8 +20,20 @@
     <button class="ghost act" bindtap="copyApInfo">复制热点密码</button>
     <button class="ghost act" bindtap="goTelemetry">看车速</button>
   </view>
+  <view class="row" style="margin-top:16rpx">
+    <text class="label">WiFi 热点</text>
+    <text class="value">{{apOn ? '已开 (OTA 模式)' : '已关 (省电, 看车速走蓝牙)'}}</text>
+  </view>
+  <view class="actions">
+    <button class="primary act" bindtap="toggleAp" disabled="{{apToggling || busy}}">
+      {{apToggling ? '处理中…' : (apOn ? '用蓝牙关热点' : '用蓝牙开热点')}}
+    </button>
+  </view>
   <view class="tip" wx:if="{{!info}}">
-    微信没有"自动连 WiFi"的接口, 手机上的热点得手动连一次:\n连 <text class="mono">{{apSsid}}</text> (密码 <text class="mono">{{apPassword}}</text>), 连上以后本页会自动接上, 不用再点"重新检测".
+    设备默认不开热点 (省电, 而且手机连上热点就断网).
+    \n要升级固件时, 先点上面「用蓝牙开热点」—— 固件会临时把 WiFi 拉起来,
+    \n然后手机去 WiFi 设置连 <text class="mono">{{apSsid}}</text> (密码 <text class="mono">{{apPassword}}</text>),
+    \n本页就会自动接上, 不用再点「重新检测」.
   </view>
 </view>
 
@@ -68,9 +80,10 @@
     {{busy ? '升级中…' : '开始升级'}}
   </button>
   <view class="tip" wx:if="{{!info}}">
-    1. 手机连接 WiFi 热点 <text class="mono">{{apSsid}}</text> (密码 {{apPassword}})
-    \n2. 页面会自己接上, 不用再点「重新检测」
-    \n3. 传输 1.5MB 大概要一分钟, 别锁屏
+    1. 点上面「用蓝牙开热点」(设备就会临时开 WiFi)
+    \n2. 手机去 WiFi 设置连 <text class="mono">{{apSsid}}</text> (密码 {{apPassword}})
+    \n3. 页面会自己接上, 不用再点「重新检测」
+    \n4. 传输 1.5MB 大概要一分钟, 别锁屏
   </view>
 </view>
 

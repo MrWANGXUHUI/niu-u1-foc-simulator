@@ -514,6 +514,13 @@ FOCSimulator simulator(&Serial1);
 
 #if OTA_AP_ENABLE
 OtaService otaService;
+
+#if BLE_ENABLE
+static void bleApToggle(bool on) {
+    if (on) otaService.startAP();
+    else    otaService.stopAP();
+}
+#endif
 #endif
 
 static uint8_t rx_buf[256];
@@ -824,6 +831,9 @@ void setup() {
     // 再放最后: bluedroid 启动要几百 ms + 几十 KB 堆, 绝不能拖慢 485 起步.
     // 失败也无所谓 —— 485 和 OTA 都不依赖 BLE.
     bleTelemetry.begin();
+#if OTA_AP_ENABLE
+    bleTelemetry.setApToggle(&bleApToggle);
+#endif
     Serial.printf("[MEM] BLE 之后 free=%d\n", esp_get_free_heap_size()); Serial.flush();
 #endif
 

@@ -1,5 +1,6 @@
 const ota = require('../../utils/ota')
 const firmwareUtil = require('../../utils/firmware')
+const ble = require('../../utils/ble')
 const app = getApp()
 
 function fmtSize(n) {
@@ -22,6 +23,8 @@ Page({
     sizeText: '',
     busy: false,
     canUpdate: false,
+    apOn: false,          // 设备上的 WiFi 热点是否开着
+    apToggling: false,    // 正在通过蓝牙开关热点
     progress: 0,
     sentText: '',
     speedText: '',
@@ -59,6 +62,60 @@ Page({
   },
 
   // ---------- 设备 ----------
+
+  // 通过蓝牙开关设备上的 WiFi 热点.
+  // 固件默认不开热点 (省电 + 手机连热点就断网), 只有要 OTA 时才临时开.
+  // 蓝牙这条路是通的 —— 看车速本来就走蓝牙, 不需要额外依赖 WiFi.
+  async toggleAp() {
+    if (this.data.apToggling) return
+    const wantOn = !this.data.apOn
+    this.setData({ apToggling: true })
+    this.log('蓝牙开热点: 正在找设备…')
+    try {
+      await ble.openAdapter()
+      const devices = await ble.discover(8000)
+      if (!devices || !devices.length) throw new Error('没找到 ' + ble.NAME_PREFIX + ' 开头的设备')
+      const dev = devices[0]
+      this.log('找到 ' + dev.name + ', 连接中…')
+
+      // 可能已经连着 (比如从车辆状态页过来的), 连不上就当复用现有连接
+      try {
+        await ble.connect(dev.deviceId)
+      } catch (e) {
+        if (!/already|已连接/i.test(e.message || '')) throw e
+      }
+
+      const cmdChar = await ble.findCharacteristic(dev.deviceId, ble.CMD_UUID)
+      await ble.writeCommand(dev.deviceId, cmdChar, wantOn ? ble.CMD_START_AP : ble.CMD_STOP_AP)
+      this.log(wantOn ? '已发开热点命令, 等设备起热点…' : '已发关热点命令')
+
+      if (!wantOn) {
+        this.setData({ apOn: false })
+        this.log('热点已关')
+        return
+      }
+
+      // 固件那边要 1~2 秒才把 WiFi 拉起来, 慢慢探
+      for (let i = 0; i < 12; i++) {
+        await new Promise((r) => setTimeout(r, 1500))
+        try {
+          const info = await ota.getInfo(this.data.ip, this.data.port)
+          this.setData({ apOn: !!info.apOn, info: info, statusText: '已连接' })
+          this.log('热点已开, IP ' + this.data.ip + ':' + this.data.port)
+          return
+        } catch (e) {
+          // 还没起来, 继续等
+        }
+      }
+      throw new Error('命令发出去了, 但设备没应答 —— 确认固件版本是不是 1.4.0 以上')
+    } catch (e) {
+      this.log('开热点失败: ' + e.message)
+      wx.showModal({ title: '开热点失败', content: e.message, showCancel: false })
+    } finally {
+      this.setData({ apToggling: false })
+    }
+  },
+
   async probe(isAfterUpdate, silent) {
     const { ip, port } = this.data
     if (!silent) this.setData({ info: null, statusText: '连接中…', canUpdate: false })
@@ -69,6 +126,7 @@ Page({
         statusText: '已连接',
         heapText: info.freeHeap ? fmtSize(info.freeHeap) : '',
         canUpdate: !!this.data.firmware,
+        apOn: info.apOn !== false,
       })
       if (!silent) {
         this.log('设备在线: v' + info.version + ' (' + info.slot + ' 分区, ' + info.state + ')')

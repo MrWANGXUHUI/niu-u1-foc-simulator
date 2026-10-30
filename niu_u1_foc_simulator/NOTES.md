@@ -2,7 +2,7 @@
 
 > 板子: 天问 Pro TW002 (ESP32-C3-DevKitC-02 + CH340K)
 > 串口: 485 → V35 ECU (8E1 9600),  UART0 (`/dev/ttyUSB0`) → 调试日志
-> 上次更新: 2026-10-29 (OLED 挪到独立任务 + 热点信道 11 + 屏幕常驻复位原因)
+> 上次更新: 2026-10-30 (蓝牙优先架构: WiFi 默认关, 蓝牙遥控开热点; 广播包名字放主广播包)
 
 ## 1. 硬件接线 (当前)
 
@@ -144,7 +144,7 @@ Arduino-ESP32 自带的 Bluedroid 蓝牙协议栈一个人就占 ~700KB (WiFi+We
 **改过分区表之后必须全量重刷一次** (上面那条 flash.sh 就是全量的),
 老固件 (factory 分区) 没有 OTA 目标分区, 刷不进新固件.
 
-## 5. 当前 setup() 顺序 (2026-10-29 版)
+## 5. 当前 setup() 顺序 (2026-10-30 版)
 
 ```
 1. Serial.begin(115200)            # 调试日志 (UART0)
@@ -154,11 +154,17 @@ Arduino-ESP32 自带的 Bluedroid 蓝牙协议栈一个人就占 ~700KB (WiFi+We
 5. simulator.begin()               # 霍尔 ISR (INPUT_PULLUP + FALLING)
 6. u8g2.begin()                    # OLED
 7. disp_lock = xSemaphoreCreateMutex() + xTaskCreate(oledTask)   # 画屏挪到独立任务
-8. otaService.begin()              # SoftAP + HTTP OTA 服务 (放最后, WiFi 初始化 ~100ms)
+8. otaService.begin()              # 只注册 HTTP 路由, **不开热点** (WiFi 默认关, 见 §6.7)
 9. bleTelemetry.begin()            # BLE GATT 服务 (再放最后, bluedroid 启动要几百 ms + 几十 KB 堆)
+10. bleTelemetry.setApToggle()     # 把"开/关热点"的实现注入给蓝牙命令通道
 ```
 
 `loop()` 里在 `updateWheelSpeed()` 之后调 `otaService.handle()` 和 `bleTelemetry.handle()` (都非阻塞).
+
+> ⚠️ **热点不能开机就开** (2026-10-30): 开了之后 BLE 广播会被共存调度影响, 而且手机一连热点就断网.
+> 现在的做法是 `otaService.begin()` 只注册路由, 真正开热点等小程序发蓝牙命令 (§6.7).
+> 另外 `server.begin()` **必须等 WiFi 栈起来才能调** —— WiFi 从没初始化过就开监听会
+> `tcpip_send_msg_wait_sem: Invalid mbox` 反复 panic, 所以挪到了 `startAP()` 里面.
 
 ## 5.0 OLED 必须跑在独立任务里 (2026-10-29 改, 关键)
 
@@ -243,6 +249,9 @@ km/h = RPM * 周长(1.28m) * 60 / 1000
 且手机 IP 和目标 IP 同网段时, **不做安全域校验, 也不用 https**.
 所以不用备案域名、不用证书、不用云开发, ESP32 也不需要任何公网出口.
 
+> ⚠️ **2026-10-30 起热点默认是关的** (v1.4.0). 平时纯蓝牙, 要 OTA 时小程序**通过蓝牙命令**
+> 临时开热点, 推完固件重启就回到默认关. 详见下面 §6.7「蓝牙优先架构」.
+
 | 项 | 值 (ota_config.h) |
 |---|---|
 | 热点 SSID | `NIU-U1-OTA` |
@@ -278,7 +287,7 @@ BLE 广播固定用 37/38/39 三个信道 (2402/2426/2428MHz), 而 WiFi 默认�
 
 | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|
-| GET | `/ota/info` | - | `{ok, version, slot, state, progress, total, freeHeap, flashUsed, md5, uptime}` |
+| GET | `/ota/info` | - | `{ok, version, slot, state, progress, total, freeHeap, flashUsed, md5, uptime, apOn}` |
 | POST | `/ota/begin` | JSON `{size, md5?}` | `{ok}` |
 | POST | `/ota/chunk` | body = base64 文本, 头 `X-Offset` = 原始字节偏移 | `{ok, written, total}` |
 | POST | `/ota/end` | - | `{ok, restart}` — 校验 + 切槽 + 重启 |
@@ -470,6 +479,103 @@ V35 用功能码 `0x02` 加两个字节问 BMS, BMS 用 `0x82` 回. 反混淆 (�
 调试口 (`/dev/ttyUSB0`) 里敲 `[TX] 68 31 CE 68 82 0F ... 16` 回车, 就把这帧喂进 485 解析链路,
 不用拆车接线就能验证 BMS 解析. 代码在 `.ino` 的 `DEBUG_INJECT_485` 块 (编译期开关).
 
+## 6.7 蓝牙优先架构 (2026-10-30 加, v1.4.0)
+
+**一句话: 平时只用蓝牙, WiFi 只在 OTA 那几分钟开一下.**
+
+### 为什么改
+
+原来的设计是开机就开 WiFi 热点, 小程序靠 HTTP 推固件. 问题:
+
+1. **手机一连热点就断网** —— 推固件的时候手机上不了网
+2. **SoftAP 一直在发信标, 白耗电** —— 车上是电池供电
+3. **两边射频同时用, BLE 广播节奏会被共存调度影响** —— 手机扫码慢
+4. OTA 一年碰不到几次, 没必要常开
+
+改成: **WiFi 默认关** (`ota_config.h` 的 `OTA_AP_DEFAULT_OFF 1`), 小程序要升级时
+**通过蓝牙发一个字节把热点临时打开**, 推完固件板子重启, 自然回到默认关的状态.
+
+### 蓝牙命令通道
+
+新增特征 `6e400005-b5a3-f393-e0a9-e50e24dcca9e` (write + read + notify):
+
+| 字节 | 含义 |
+|---|---|
+| `0x57` (`'W'`) | 开 OTA 热点 |
+| `0x58` (`'X'`) | 关 OTA 热点 |
+
+小程序侧 (`miniprogram/utils/ble.js`): `writeCommand(deviceId, cmdChar, 'W')`.
+固件侧 (`ble_telemetry.h`): `BleCmdCb::onWrite` 收到后**只排队**, 由主循环 `handle()` 执行 ——
+BLE 回调跑在蓝牙任务里, 在那边动 WiFi 会跟共存调度打架.
+
+### 三个必须知道的坑
+
+**1. 写命令必须用带 param 的 `onWrite` 重载**
+
+```cpp
+void onWrite(BLECharacteristic* ch, esp_ble_gatts_cb_param_t* param) override;
+```
+
+废弃版 `onWrite(pCharacteristic)` 里的 `getValue()` **拿不到刚写进来的字节** ——
+实测写 `0x57` 读回来是 `0x00`. 要用 `param->write.value[]`.
+
+**2. 命令字节取最后一个, 不是第一个**
+
+`gatttool` 之类的工具写 `0x57` 会被当成 2 字节大端 (`00 57`), 取头就拿到 `0x00` 了.
+小程序用的是 `wx.writeBLECharacteristicValue` (原始 ArrayBuffer), 不会有这问题,
+但固件取最后一个字节更保险.
+
+**3. 重新开热点时 HTTP server 必须重绑**
+
+`WebServer::begin()` 内部先 `close()` 再监听, 所以 `startAP()` 里**每次都调** `bindServer()`.
+不重绑的话「关热点再开」之后 HTTP 端口收不到任何请求 (lwIP 被 `WIFI_OFF` 拆过, 老 socket 废了).
+
+### 关热点不能用 `WiFi.mode(WIFI_OFF)`
+
+`WIFI_OFF` 会走 `espWiFiStop()` → `esp_wifi_stop()` + lwIP 反初始化, **整个 WiFi 协议栈被拆掉**.
+改成只切模式: `esp_wifi_set_mode(WIFI_MODE_NULL)` —— 热点停止广播, 协议栈留着,
+`startAP()` 随时能开回来.
+
+### 广播包布局 (iPhone 能不能扫到的关键)
+
+| 包 | 内容 |
+|---|---|
+| 主广播包 | Flags(0x06) + 完整设备名 (10 字节) |
+| 扫描回应 | 完整设备名 + 128 位 Service UUID (共 30 字节, 在 31 字节上限内) |
+
+**名字必须在主广播包里.** 库默认行为是把名字和 UUID 全塞扫描回应, 主广播包只有 Flags ——
+而扫描回应只有**主动扫描**才收得到 (手机发 SCAN_REQ). iPhone 后台的小程序是**被动扫描**,
+收不到扫描回应, 看到的就是"一个没名字的设备", 直接被名字过滤掉.
+Linux 用主动扫描所以一直能看到 —— 台架上测不出这个坑.
+
+扫描回应里加 UUID 是为了"按服务 UUID 过滤"的扫描器也能匹配上. 注意 31 字节上限:
+Flags(3) + 名字(12) + UUID(18) = 33 **超了**, `addData` 会静默丢弃 ——
+所以扫描回应里**不放 Flags**, 刚好 30 字节.
+
+### 实测数据 (2026-10-30, 台架)
+
+用 `hcitool lescan --duplicates` 抓 12 秒原始广播包:
+
+| 状态 | 广播包数 | 折算频率 |
+|---|---|---|
+| WiFi 关 | 100 | ~8.3/秒 (间隔 ~120ms) |
+| WiFi 开 | 117 | ~9.75/秒 |
+| WiFi 开 + 有客户端在线 | 117 | ~9.75/秒 |
+
+> ⚠️ **踩过的坑: 别用 btmon 的次数下结论.** btmon 抓的是控制器**重复过滤之后**的上报,
+> 看起来像"16 秒才广播一次" —— 那是过滤器的假象, 不是真的限流.
+> 要看真实节奏必须用 `hcitool lescan --duplicates` (要 root, 且要先停 bluetoothd).
+
+### 台架已验证
+
+- BLE 写 `0x57` → 热点起来 (信道 11 / 192.168.4.1:8080) ✅
+- BLE 写 `0x58` → 热点关 ✅
+- 开→关→开→关 连做 4 次, 无 panic 无复位 ✅
+- 广播包内容用 btmon 核对过: 主广播包带完整名字 ✅
+
+**没验证的**: HTTP 端到端 (这台开发机的无线网卡扫不到 2.4GHz, 连不上 ESP32 热点),
+需要用户在车上用小程序实测.
+
 ## 7. 已知问题 / 坑
 
 | 问题 | 状态 | 备注 |
@@ -492,6 +598,7 @@ V35 用功能码 `0x02` 加两个字节问 BMS, BMS 用 `0x82` 回. 反混淆 (�
 | 485 分帧靠 0x16 找帧尾 | ✅ 修 | 数据区里也可能有 0x16 (明文 0xE3 + 0x33), 会把帧劈成两半 → 改成按长度字节定帧 (见 §6.6) |
 | 电池 BMS 报文 | 🔄 待上车实测 | 解析器用真车抓包的 2041 帧 BMS 报文逐字段核对过 (100% 解析成功, 校验和 0 错); BLE 打包格式也跟小程序端对过; 但**装到车上抓真实 BMS 报文还没测** (板子当时没接在车上的 485 总线上) |
 | BLE 断连后不广播 | ✅ 修 | 在 `onDisconnect` 回调里重启广播会被静默丢掉, 必须延后到主循环 (见 §6.5) |
+| **iPhone 扫不到 NIU-U1-BLE** | 🔄 2026-10-30 改 | 见 §7.3 专项. 根因是**广播包布局**: 库默认把名字塞扫描回应, 而 iPhone 后台小程序是**被动扫描**、收不到扫描回应 → 看到"没名字的设备"被过滤掉. 改成名字放主广播包. 另外把 WiFi 改成默认关 (蓝牙优先, 见 §6.7). 台架用 btmon 核对过广播包内容, 但**真机 iPhone 还没实测** |
 | BLE 重连后单体电压/型号串不再推 | ✅ 修 | 这两条是"变了才推", 重连后手机状态是空的 → 断连时清哈希 (见 §6.5) |
 | iOS 本地网络权限 | ⚠️ 注意 | iOS 14+ 第一次连热点时微信会弹「本地网络」授权, 要点允许, 否则小程序发不出请求 |
 | 安卓 BLE 扫描要定位权限 | ⚠️ 注意 | Android 6+ 扫蓝牙要「定位」权限, 不给就扫不到设备 |
@@ -579,6 +686,82 @@ V35 用功能码 `0x02` 加两个字节问 BMS, BMS 用 `0x82` 回. 反混淆 (�
 4. 连上了但小程序连不上 → 看小程序日志, 它会提示 iOS 本地网络权限 / 域名白名单
 5. 插上 USB 看串口里的 `[AP] ... 客户端:N` —— N 一直是 0 就是压根没关联上
 
+## 7.3 "iPhone 扫不到 NIU-U1-BLE" 的排查过程 (2026-10-30)
+
+用户反馈: 用小程序升级完固件之后, iPhone 的蓝牙列表里**看不到** NIU-U1-BLE,
+只能看到别的设备 (TCL 电视). 小程序的报错也没变化.
+
+**排查第一步: 确认板子本身正常.** 台架上 `bluetoothctl` 能扫到 `NIU-U1-BLE` (RSSI -44 ~ -52dBm),
+`bluetoothctl connect` 也能连上, 四个特征 + 2902 描述符都在. 所以**固件和手机之间的射频没问题**.
+
+**第二步: 读 flash 确认跑的是哪版固件.** `esptool read_flash` 把两个槽都读出来对比:
+
+- app0 (0x10000): 版本串 `1.3.1`
+- app1 (0x1E0000): 版本串 `1.3.2`, 头 16KB 与小程序包里的固件**逐字节相同**
+  (说明 OTA 确实写进去了)
+
+app0 与 1.3.2 的包整包只差 **66 个字节** (32 字节编译哈希 + 版本号 3 个字符 + 尾部哈希),
+也就是说**代码完全一样** —— 1.3.1 那次构建就已经包含了广播布局的改动. OTA 生效了.
+
+**第三步: 看广播包到底长什么样.** `btmon` 抓 HCI:
+
+```
+LE Advertising Report (0x02)
+  Event type: Connectable undirected - ADV_IND (0x00)
+  Address: E8:3D:C1:8D:D4:06
+  Data length: 15
+  Flags: 0x06
+  Name (complete): NIU-U1-BLE
+```
+
+名字在包里的. 那为什么 iPhone 看不到?
+
+**根因: iPhone 后台小程序是「被动扫描」, 而被动扫描收不到扫描回应 (SCAN_RSP).**
+
+蓝牙分两种扫描:
+- **主动扫描**: 手机发 SCAN_REQ, 外设回 SCAN_RSP —— 能拿到扫描回应里的内容
+- **被动扫描**: 手机只听广播包 (ADV_IND) —— **扫描回应里的东西一概收不到**
+
+Arduino BLE 库的默认布局是「主广播包只放 Flags, 名字和 UUID 全塞扫描回应」.
+Linux 的 `bluetoothctl` 用主动扫描, 所以一直看得到 —— **台架上测不出这个坑**.
+而 iPhone 上微信小程序在后台用的是被动扫描, 拿到的只有 Flags 没有名字,
+按名字前缀 `NIU-U1` 一过滤就把它扔了.
+
+**改动 (固件 1.4.0)**:
+
+1. **自定义广播包**: 主广播包 = Flags(0x06) + 完整设备名; 扫描回应 = 名字 + 128 位 UUID
+   (用 `BLEAdvertisementData` + `setAdvertisementData` / `setScanResponseData`).
+   名字必须放主广播包 —— 所有扫描方式都收得到.
+2. 扫描回应里加 UUID 是为了"按服务 UUID 过滤"的扫描器也能匹配上.
+   注意 31 字节上限: Flags(3)+名字(12)+UUID(18)=33 超了会被静默丢弃, 所以扫描回应里**不放 Flags**.
+3. **WiFi 改成默认关** (蓝牙优先, 见 §6.7) —— 顺带解决"手机连热点就断网"和功耗.
+4. 广播间隔显式设成 100~150ms (`setMinInterval(160)` / `setMaxInterval(240)`).
+
+**一个自己踩的坑: 用 btmon 的次数下结论会错.** 中途 btmon 显示"ESP32 16 秒才广播一次"
+(14.3s / 30.3s / 46.3s / 62.3s 各一次), 一度以为是共存调度限流, 还据此改了架构.
+用 `hcitool lescan --duplicates` 抓**原始**广播包才看明白:
+
+| 状态 | 12 秒内广播包数 | 折算 |
+|---|---|---|
+| WiFi 关 | 100 | ~8.3/秒 |
+| WiFi 开 | 117 | ~9.75/秒 |
+| WiFi 开 + 有客户端在线 | 117 | ~9.75/秒 |
+
+**广播一直正常.** btmon 抓的是控制器**重复过滤之后**的上报, 那个"16 秒"是过滤器的假象.
+(查共存问题必须用 `hcitool lescan --duplicates`, 要 root 且先停 bluetoothd.)
+
+**台架已验证**: 广播包内容用 btmon 核对过 (主广播包带完整名字);
+BLE 开/关热点命令通路打通; 开→关→开→关 循环 4 次无 panic.
+
+**还没验证的**: iPhone 真机行为. 这台机器没有 iPhone, 而且无线网卡扫不到 2.4GHz,
+连 ESP32 热点都连不上 —— **HTTP 端到端也没法在台架上验**, 需要用户实测.
+
+上车后按这个顺序看:
+
+1. iPhone 设置 → 蓝牙, 能不能看到 NIU-U1-BLE (在"其他设备"里, 不是"我的设备")
+2. 微信 → 小程序 → 车辆状态页, 点连接, 看报的什么错
+3. 固件升级页 → 点「用蓝牙开热点」, 看热点能不能起来 (串口会打 `[OTA] 热点 ... 已启动`)
+
 ## 8. 调试技巧
 
 - **看 485 收**: loop() 里 `[485←]` 逐字节回显, 帧尾 0x16 换行
@@ -594,10 +777,10 @@ V35 用功能码 `0x02` 加两个字节问 BMS, BMS 用 `0x82` 回. 反混淆 (�
 | 文件 | 作用 |
 |---|---|
 | `src/niu_u1_foc_simulator.ino` | 主程序, 唯一 .ino |
-| `src/ota_config.h` | OTA 配置: SSID / 密码 / IP / 端口 / 分块大小 / 固件版本号 / 固件大小上限 |
-| `src/ota_server.h` | OTA 服务端 (header-only): SoftAP + HTTP `/ota/*` + base64 解码 |
-| `src/ble_config.h` | BLE 配置: 设备名 / Service / 特征 UUID / 推送周期 |
-| `src/ble_telemetry.h` | BLE 遥测服务 (header-only): GATT 服务 + 通知 + 断连后重新广播 |
+| `src/ota_config.h` | OTA 配置: SSID / 密码 / IP / 端口 / 分块大小 / 固件版本号 / 固件大小上限 / `OTA_AP_DEFAULT_OFF` |
+| `src/ota_server.h` | OTA 服务端 (header-only): SoftAP + HTTP `/ota/*` + base64 解码 + 热点开关 |
+| `src/ble_config.h` | BLE 配置: 设备名 / Service / 特征 UUID (含命令特征 `6e400005`) / 推送周期 |
+| `src/ble_telemetry.h` | BLE 遥测服务 (header-only): GATT 服务 + 通知 + 断连后重新广播 + 热点遥控命令 |
 | `src/ble_battery_msg.h` | 电池信息的 BLE 打包格式 (纯 C++, 可在 PC 上编译跑测试) |
 | `src/bms_protocol.h` | 电池 BMS 报文解析 (纯 C++, 可在 PC 上编译跑测试) |
 | `platformio.ini` | build flags: CORE_DEBUG_LEVEL=3, flash_size=4MB, CDC_ON_BOOT=1 |

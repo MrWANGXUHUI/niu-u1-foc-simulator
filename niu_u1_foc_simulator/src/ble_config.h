@@ -18,6 +18,8 @@
 #define BLE_FRAME_UUID      "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 // 电池信息 (BMS 解析结果). 一条特征上跑多种消息, 用消息头区分, 见 ble_telemetry.h
 #define BLE_BATTERY_UUID    "6e400004-b5a3-f393-e0a9-e50e24dcca9e"
+// 命令特征 (write): 小程序往里写单字节命令, 见 ble_telemetry.h 的 BleCommand
+#define BLE_CMD_UUID        "6e400005-b5a3-f393-e0a9-e50e24dcca9e"
 
 // 遥测推送周期 (ms). 5Hz 足够看车速, 也够省电
 #define BLE_NOTIFY_PERIOD_MS 200

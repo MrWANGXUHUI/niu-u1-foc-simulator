@@ -34,6 +34,7 @@
 #include <WebServer.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
+#include <esp_wifi.h>
 
 #include "ota_config.h"
 
@@ -47,18 +48,61 @@ public:
     OtaService() : server(OTA_HTTP_PORT) {}
 
     void begin() {
+#if OTA_AP_DEFAULT_OFF
+        // 默认不开热点 —— WiFi+BLE 共存会把 BLE 广播限到 ~16 秒一次, iPhone 扫不到.
+        // 平时纯蓝牙; 小程序通过 BLE 发 'W' 命令才临时开热点, OTA 完重启自动回到默认关.
+        // 注意: server.begin() 必须等 WiFi 栈起来才能调 (lwIP 没初始化时开监听
+        // 会 tcpip_send_msg_wait_sem assert 反复 panic), 所以挪到 startAP() 里.
+        Serial.println("[OTA] WiFi 默认关 (蓝牙优先), 蓝牙 'W' 命令可临时开热点");
+#else
+        startAP();
+#endif
+    }
+
+    // 开热点. BLE 命令触发, 每次都重新配置一遍 (信道/功率在 softAP 里设)
+    void startAP() {
         IPAddress ip(OTA_AP_IP);
         WiFi.mode(WIFI_AP);
         WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0));
-        // 信道见 ota_config.h 的说明 —— 默认的 1 信道跟 BLE 广播信道撞车, 手机连不上
+        // 信道见 ota_config.h 的说明
         bool ok = WiFi.softAP(OTA_AP_SSID, OTA_AP_PASSWORD, OTA_AP_CHANNEL);
-        WiFi.setSleep(false);   // 关掉 modem sleep, 否则 AP 会时不时把客户端踢掉
-        // 发射功率从默认 19.5dBm 降到 8.5dBm.
-        // 手机就贴在车边, 功率再高也没用; 而 WiFi 满功率发射的瞬时电流能到 300mA+,
-        // 车上供电是 48V 降压下来的, 功率越小越不容易把板子拉棕断 (棕断=反复重启=
-        // 热点掉线+屏幕闪烁). 功率不够的话手机连不上, 但距离只有一两米, 8.5dBm 绰绰有余.
+        WiFi.setSleep(false);
         WiFi.setTxPower(WIFI_POWER_8_5dBm);
+        apOn_ = true;
+        // 每次都重绑: WiFi.mode(WIFI_OFF) 会把 lwIP 一起销毁, 老的监听 socket
+        // 就废了, 不重绑的话"关热点再开"之后 HTTP 端口收不到任何请求.
+        // WebServer::begin() 内部先 close() 再监听, 所以重复调是安全的.
+        bindServer();
+        Serial.printf("[OTA] 热点 %s %s  信道%d  IP %s:%d\n",
+                      OTA_AP_SSID, ok ? "已启动" : "启动失败", OTA_AP_CHANNEL,
+                      ip.toString().c_str(), OTA_HTTP_PORT);
+    }
 
+    // 关热点, 把射频还给 BLE.
+    // 注意: 不能用 WiFi.mode(WIFI_OFF) —— 那会把整个 WiFi 协议栈拆掉 (esp_wifi_stop
+    // + lwIP 反初始化), 之后想再开热点要重新初始化一堆东西, 慢且容易出问题.
+    // 这里只把模式切到 WIFI_MODE_NULL: 热点停止广播, 但协议栈留着, startAP() 随时能开回来.
+    void stopAP() {
+        WiFi.softAPdisconnect(true);
+        esp_wifi_set_mode(WIFI_MODE_NULL);
+        apOn_ = false;
+        Serial.println("[OTA] 热点已关, BLE 独占射频");
+    }
+
+    bool apOn() const { return apOn_; }
+
+    // 路由注册 + 监听. 只能等 WiFi 栈起来 (第一次 startAP) 才能做:
+    // WiFi 从没初始化过就 server.begin() 会 lwIP assert 反复 panic
+    // (tcpip_send_msg_wait_sem: Invalid mbox).
+    void bindServer() {
+        bindRoutes();
+        server.begin();
+        serverBound_ = true;
+    }
+
+    // 路由注册只需要做一次 (路由表不变), 监听每次开热点重做
+    void bindRoutes() {
+        if (routesBound_) return;
         server.on("/ota/info",  HTTP_GET,  [this] { handleInfo();  });
         server.on("/ota/begin", HTTP_POST, [this] { handleBegin(); });
         server.on("/ota/chunk", HTTP_POST, [this] { handleChunk(); });
@@ -67,16 +111,12 @@ public:
         server.onNotFound([this] {
             server.send(404, "application/json", "{\"ok\":false,\"error\":\"not found\"}");
         });
-        server.begin();
-
-        Serial.printf("[OTA] 热点 %s %s  信道%d  IP %s:%d\n",
-                      OTA_AP_SSID, ok ? "已启动" : "启动失败", OTA_AP_CHANNEL,
-                      ip.toString().c_str(), OTA_HTTP_PORT);
+        routesBound_ = true;
     }
 
     // 主循环里调, 不阻塞
     void handle() {
-        server.handleClient();
+        if (apOn_) server.handleClient();
 
         // 传输卡住太久 → 放弃, 否则下一次 Update.begin() 会因为"已有升级在进行"直接失败
         if (state_ == RECEIVING && millis() - lastRxAt_ > OTA_RX_TIMEOUT_MS) {
@@ -105,6 +145,9 @@ public:
 
 private:
     WebServer server;
+    bool apOn_ = false;
+    bool serverBound_ = false;
+    bool routesBound_ = false;
     State state_ = IDLE;
     uint32_t totalSize_ = 0;
     uint32_t written_ = 0;
@@ -191,8 +234,9 @@ private:
         snprintf(buf, sizeof(buf),
                  "{\"ok\":true,\"version\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"port\":%d,"
                  "\"state\":\"%s\",\"progress\":%u,\"total\":%u,\"freeHeap\":%u,\"flashUsed\":%u,"
-                 "\"slot\":\"%s\",\"md5\":\"%s\",\"uptime\":%lu}",
+                 "\"slot\":\"%s\",\"md5\":\"%s\",\"uptime\":%lu,\"apOn\":%d}",
                  OTA_FW_VERSION, OTA_AP_SSID, WiFi.softAPIP().toString().c_str(), OTA_HTTP_PORT,
+                 (int)apOn_,
                  stateName(), written_, totalSize_,
                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getSketchSize(),
                  running ? running->label : "?", md5_,

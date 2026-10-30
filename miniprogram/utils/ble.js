@@ -11,7 +11,12 @@ const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e'
 const TELEMETRY_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'
 const FRAME_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'
 const BATTERY_UUID = '6e400004-b5a3-f393-e0a9-e50e24dcca9e'
+const CMD_UUID = '6e400005-b5a3-f393-e0a9-e50e24dcca9e'
 const NAME_PREFIX = 'NIU-U1'
+
+// 命令字节 —— 对应固件 ble_telemetry.h 的 BleCommand
+const CMD_START_AP = 'W'   // 临时开 OTA 热点
+const CMD_STOP_AP = 'X'    // 关热点
 
 // 电池消息类型 —— 对应固件 ble_telemetry.h 的 BLE_BMSG_*
 const BMSG_STATUS = 1
@@ -157,6 +162,35 @@ async function subscribe(deviceId, charUuid) {
   return { serviceId: svc.uuid, characteristicId: ch.uuid }
 }
 
+// 找到特征值但不订阅 —— 用于只写不听的场合 (命令特征)
+async function findCharacteristic(deviceId, charUuid) {
+  const services = await call('getBLEDeviceServices', { deviceId })
+  const svc = (services.services || []).find(
+    (s) => (s.uuid || '').toLowerCase() === SERVICE_UUID.toLowerCase()
+  )
+  if (!svc) throw new Error('设备上没有预期的服务, 可能不是我们的固件')
+
+  const chars = await call('getBLEDeviceCharacteristics', { deviceId, serviceId: svc.uuid })
+  const ch = (chars.characteristics || []).find(
+    (c) => (c.uuid || '').toLowerCase() === charUuid.toLowerCase()
+  )
+  if (!ch) throw new Error('设备上没有预期的特征值')
+  return { serviceId: svc.uuid, characteristicId: ch.uuid }
+}
+
+// 往命令特征写一个字节 ('W' 开热点 / 'X' 关热点)
+async function writeCommand(deviceId, cmdChar, byte) {
+  const buf = new Uint8Array(1)
+  buf[0] = byte.charCodeAt(0)
+  await call('writeBLECharacteristicValue', {
+    deviceId,
+    serviceId: cmdChar.serviceId,
+    characteristicId: cmdChar.characteristicId,
+    value: buf.buffer,
+    writeType: 'write',
+  })
+}
+
 // 解析遥测载荷 (20 字节小端; 前 12 字节是旧格式, 老固件也认)
 function parseTelemetry(buffer) {
   const v = new DataView(buffer)
@@ -277,12 +311,17 @@ module.exports = {
   TELEMETRY_UUID,
   FRAME_UUID,
   BATTERY_UUID,
+  CMD_UUID,
   NAME_PREFIX,
+  CMD_START_AP,
+  CMD_STOP_AP,
   openAdapter,
   closeAdapter,
   discover,
   connect,
   subscribe,
+  findCharacteristic,
+  writeCommand,
   parseTelemetry,
   bufferToHex,
   createBatteryState,

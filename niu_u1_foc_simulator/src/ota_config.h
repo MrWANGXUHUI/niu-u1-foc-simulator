@@ -20,11 +20,21 @@
 
 // 固件版本号, 只通过 /ota/info 和 OLED 暴露.
 // 不改 485 协议的 0x01 04 应答 (仍回 0x11), 免得破坏已经跑通的 V35 交互.
-#define OTA_FW_VERSION   "1.3.2"
+#define OTA_FW_VERSION   "1.4.0"
 
 // 单个 app 槽的大小上限 —— 必须跟 partitions.csv 里的 app0/app1 一致.
 // 超过就 Update.begin() 直接报 UPDATE_ERROR_SIZE.
 #define OTA_MAX_FIRMWARE_SIZE 0x1D0000
 
-// 0 = 完全关掉 WiFi 和 OTA 服务 (纯 485 模式)
+// 0 = 实现里不编译 WiFi/OTA 代码
 #define OTA_AP_ENABLE    1
+
+// 1 = 开机不开热点, 蓝牙遥控开 (见 ble_telemetry.h 的 'W'/'X' 命令).
+// 为什么默认关:
+//   1) SoftAP 一直在发信标, 白耗电 (车上是电池供电)
+//   2) 手机一连热点就断网 —— 看车速用 BLE 完全够, 手机还能照常上网
+//   3) OTA 本来就一年碰不到几次, 需要时再开
+//   4) 两边射频同时用的时候, BLE 广播间隔会被共存调度拉长, 手机扫码慢
+// 实测 (hcitool lescan --duplicates, 12 秒): WiFi 关 100 个广播包, WiFi 开 117 个 ——
+// 广播本身都正常, 但省电和不掉网的收益是真的.
+#define OTA_AP_DEFAULT_OFF 1

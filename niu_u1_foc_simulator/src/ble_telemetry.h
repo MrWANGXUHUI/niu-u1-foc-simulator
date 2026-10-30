@@ -62,9 +62,33 @@ struct BleTelemetryData {
     uint8_t  interval_x10;    // 最近一次脉冲间隔 (10ms 单位)
 };
 
+class BleCommand {
+public:
+    // 命令集 —— 单字节, 大写字母好认 (小程序日志里能直接看到)
+    static const uint8_t CMD_START_AP  = 'W';   // 临时开 OTA 热点 (推固件用)
+    static const uint8_t CMD_STOP_AP   = 'X';   // 关热点, 射频还给蓝牙
+    // 回执状态码
+    static const uint8_t REPLY_DONE      = 1;
+    static const uint8_t REPLY_NOSUPPORT = 0xFF;
+};
+
+class BleTelemetry;
+
+// 命令特征的回调 —— 只记下「收到了什么」, WiFi 开关由主循环执行
+// (BLE 回调跑在蓝牙任务里, 在那边动 WiFi 会跟共存调度打架, 必须延后)
+class BleCmdCb : public BLECharacteristicCallbacks {
+public:
+    explicit BleCmdCb(BleTelemetry* owner) : owner_(owner) {}
+    // 必须用带 param 的重载: 废弃版 onWrite(pCharacteristic) 里 getValue() 拿到的
+    // 不一定是刚写进来的字节 (实测写 0x57 读回来是 0x00). param->write 才是原始数据.
+    void onWrite(BLECharacteristic* ch, esp_ble_gatts_cb_param_t* param) override;
+private:
+    BleTelemetry* owner_;
+};
+
 class BleTelemetry {
 public:
-    BleTelemetry() : serverCb_(this) {}
+    BleTelemetry() : serverCb_(this), cmdCb_(this) {}
 
     // BLE 初始化 (bluedroid 启动, 几百 ms). 失败返回 false, 不影响 485 主功能
     bool begin() {
@@ -91,6 +115,13 @@ public:
                                              BLECharacteristic::PROPERTY_READ);
         battery_->addDescriptor(new BLE2902());
 
+        cmdChar_ = svc->createCharacteristic(BLE_CMD_UUID,
+                                         BLECharacteristic::PROPERTY_WRITE |
+                                         BLECharacteristic::PROPERTY_READ |
+                                         BLECharacteristic::PROPERTY_NOTIFY);
+        cmdChar_->addDescriptor(new BLE2902());
+        cmdChar_->setCallbacks(&cmdCb_);
+
         svc->start();
 
         // 广播包布局很关键 (踩过坑):
@@ -100,16 +131,21 @@ public:
         //   过滤掉了. 所以必须用自定义广播包: 名字放主广播包 (所有扫描都收得到),
         //   128 位 UUID 放扫描回应 (连接前用不上, 连接时靠逐个特征枚举).
         BLEAdvertising* adv = BLEDevice::getAdvertising();
+        // 广播间隔: 单位 0.625ms, 160/240 = 100~150ms 一发 (实测 ~8 个/秒).
+        // 库默认 20~40ms 更快, 但那是在纯蓝牙下测的; 留点余量给 WiFi 共存调度.
+        adv->setMinInterval(160);   // 100ms
+        adv->setMaxInterval(240);   // 150ms
         BLEAdvertisementData advData;
         advData.setFlags(0x06);                       // LE General Discovery + BR/EDR 不支持
         advData.setName(BLE_DEVICE_NAME);             // 名字必须在主广播包里!
         adv->setAdvertisementData(advData);
 
         BLEAdvertisementData scanRsp;
-        scanRsp.setFlags(0x06);
+        // 扫描回应里放名字 + 128 位 UUID (不带 Flags: 名字 12 + UUID 18 = 30 字节,
+        // 刚好在 31 字节上限内; 加 Flags 就超了, addData 会静默丢弃).
+        // 带上 UUID 是为了让"按服务 UUID 过滤"的扫描器也能匹配上.
         scanRsp.setName(BLE_DEVICE_NAME);
-        // 128 位 UUID 放不进扫描回应 (flags 3 + 名字 12 + UUID 18 = 33 > 31 上限,
-        // addData 会静默丢弃), 干脆不放 —— 连接后靠服务枚举就够了, 小程序也不按 UUID 过滤
+        scanRsp.setCompleteServices(BLEUUID(BLE_SERVICE_UUID));
         adv->setScanResponseData(scanRsp);
         adv->setScanResponse(false);   // 不再让库自动拼扫描回应, 上面那份就是
         adv->start();
@@ -138,9 +174,42 @@ public:
     // 电池信息 —— BMS 应答解析出来的结果
     void publishBattery(const BmsInfo& info) { bms_ = info; }
 
+    // ---- WiFi 热点遥控 (蓝牙优先方案的核心) ----
+
+    // 命令回调只记下命令, 主循环 handle() 里执行, 回统一走 notifyReply()
+    void queueCommand(uint8_t cmd) { cmdByte_ = cmd; cmdPending_ = true; }
+
+    // 命令回执通知: [0]=命令 [1]=状态 (0=收到 1=已执行 0xFF=不认识)
+    void notifyReply(uint8_t cmd, uint8_t state) {
+        if (!cmdChar_ || !connected_) return;
+        uint8_t b[2] = { cmd, state };
+        cmdChar_->setValue(b, sizeof(b));
+        cmdChar_->notify();
+    }
+
+    // 命令执行的钩子 —— 主程序 (.ino) 注入真正的 WiFi 开关实现, 该头不依赖 ota_server.h
+    typedef void (*ApToggleFn)(bool on);
+    void setApToggle(ApToggleFn fn) { apToggle_ = fn; }
+
+    bool cmdPending() const { return cmdPending_; }
+
+
     // 主循环里调, 不阻塞
     void handle() {
         unsigned long now = millis();
+
+        // 执行蓝牙命令队列里的 WiFi 开关 —— 必须延后到主循环:
+        // BLE 回调跑在蓝牙任务里, 在那边动 WiFi 会跟共存调度打架
+        if (cmdPending_) {
+            uint8_t cmd = cmdByte_;
+            cmdPending_ = false;
+            if (apToggle_) {
+                apToggle_(cmd == BleCommand::CMD_START_AP);
+                notifyReply(cmd, BleCommand::REPLY_DONE);
+            } else {
+                notifyReply(cmd, BleCommand::REPLY_NOSUPPORT);
+            }
+        }
 
         // 断了以后要重新广播. 关键: 不能在 BLE 的回调里直接调 advertising->start() ——
         // 那个回调跑在蓝牙任务里, 这时候 GAP 状态机还没处理完断连, 启动广播会被
@@ -284,9 +353,14 @@ private:
     }
 
     ServerCb serverCb_;
+    BleCmdCb cmdCb_;
     BLECharacteristic* telemetry_ = nullptr;
     BLECharacteristic* frame_ = nullptr;
     BLECharacteristic* battery_ = nullptr;
+    BLECharacteristic* cmdChar_ = nullptr;
+    uint8_t cmdByte_ = 0;
+    bool cmdPending_ = false;
+    ApToggleFn apToggle_ = nullptr;
     BleTelemetryData data_ = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     BmsInfo bms_ = {0};
     uint16_t lastCellsHash_ = 0;
@@ -300,5 +374,17 @@ private:
     uint16_t frameSeq_ = 0;
     uint16_t lastFrameSeq_ = 0;
 };
+
+// 命令特征写入回调 —— 只排队, 不执行 (WiFi 开关必须回主循环)
+inline void BleCmdCb::onWrite(BLECharacteristic* ch, esp_ble_gatts_cb_param_t* param) {
+    if (!owner_ || !param) return;
+    uint16_t len = param->write.len;
+    if (len == 0) return;
+    // 取最后一个字节: 小程序写 1 字节就是它自己; 而 gatttool 之类的工具写 "0x57"
+    // 会被当成 2 字节大端 (00 57), 取头就拿到 0x00 了.
+    uint8_t cmd = param->write.value[len - 1];
+    owner_->queueCommand(cmd);
+    Serial.printf("[BLE] 命令 0x%02X 已排队\n", cmd);
+}
 
 #endif
