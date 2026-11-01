@@ -23,6 +23,11 @@
 
 // 遥测推送周期 (ms). 5Hz 足够看车速, 也够省电
 #define BLE_NOTIFY_PERIOD_MS 200
+
+// 定期重启广播的周期 (ms). 只在没连手机的时候做.
+// 起因: 有一次重启广播正好撞上 GAP 状态机没准备好, 被静默丢掉 —— 板子还活着、
+// 485 正常, 但 BLE 再也不广播, 手机永远扫不到. 这种状态没法自查, 只能定期重来.
+#define BLE_REBROADCAST_PERIOD_MS 15000
 // 单条 notify 的最大字节数. 蓝牙协商不出 MTU 时最小是 20, 帧长按这个切块
 #define BLE_MAX_NOTIFY_LEN   20
 

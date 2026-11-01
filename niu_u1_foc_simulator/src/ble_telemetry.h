@@ -219,12 +219,16 @@ public:
             advRestartAt_ = 0;
             lastDisconnectAt_ = now;
             Serial.println("[BLE] 重新广播");
-        } else if (!connected_ && lastDisconnectAt_ &&
-                   (now - lastDisconnectAt_) > 30000) {
-            // 兜底: 断连 30 秒后还是扫不到设备, 说明广播没起来, 再试一次
+        } else if (!connected_ && (now - lastAdvCheckAt_) > BLE_REBROADCAST_PERIOD_MS) {
+            // 兜底: 定期重启广播.
+            // 为什么必须这么做: 上面的"重新广播"只在断连回调触发过一次, 而那次
+            // advertising->start() 有可能正好撞上 GAP 状态机没准备好而被静默丢掉 ——
+            // 代码却以为成功了, 于是设备从此再也不广播 (板子活着, 485 正常, 但手机扫不到).
+            // 这种状态在车上没法自查, 只能靠定期重来一遍保证广播一定活着.
             BLEDevice::getAdvertising()->start();
+            lastAdvCheckAt_ = now;
             lastDisconnectAt_ = now;
-            Serial.println("[BLE] 广播没起来, 重试");
+            Serial.println("[BLE] 广播重启 (定期兜底)");
         }
 
         if (!connected_) return;
@@ -369,6 +373,7 @@ private:
     unsigned long lastNotify_ = 0;
     unsigned long advRestartAt_ = 0;
     unsigned long lastDisconnectAt_ = 0;
+    unsigned long lastAdvCheckAt_ = 0;
     uint8_t frameBuf_[64];
     size_t frameLen_ = 0;
     uint16_t frameSeq_ = 0;

@@ -73,17 +73,31 @@ function closeAdapter() {
 }
 
 // 扫设备, 只留名字像我们的. 返回 [{deviceId, name, rssi}]
+//
+// ⚠️ services 参数在 iOS 上有坑: 微信的文档写"只搜索广播包有对应 UUID 的主服务的设备",
+// 但实现上 iOS 传空数组会被当成"过滤条件非空", 结果**只上报广播里带服务 UUID 的设备**.
+// 我们现在主广播包只有 Flags + 名字 (名字必须放主广播包, 见固件 ble_telemetry.h),
+// 128 位 UUID 在扫描回应里 —— 于是正好被这个过滤挡掉, iPhone 怎么扫都扫不到.
+// 所以这里**不传 services**, 扫到全部再自己在 JS 里按名字筛.
+//
+// 顺带记下扫到的**所有**设备 (不只是匹配上的), 失败时报错里全列出来 ——
+// iPhone 上"扫不到"的原因有好几个 (权限 / iOS 缓存 / 名字没广播出来),
+// 光看一句"没找到"没法区分, 看到具体扫到了什么才行.
 function discover(timeoutMs) {
   return new Promise((resolve, reject) => {
     let done = false
     const found = {}
-    const seen = {}   // 扫到的所有设备 (不管名字对不对) —— 用来在失败时说明到底扫到了什么
+    const seen = {}   // 扫到的所有设备 (不管名字对不对)
 
     const onFound = (res) => {
       const list = (res && res.devices) || []
       for (const d of list) {
         const name = d.name || d.localName || ''
-        seen[d.deviceId] = name || '(名字为空)'
+        seen[d.deviceId] = {
+          name: name,
+          rssi: d.RSSI,
+          uuids: d.advertisServiceUUIDs || [],
+        }
         if (!name || name.indexOf(NAME_PREFIX) !== 0) continue
         found[d.deviceId] = { deviceId: d.deviceId, name: name, rssi: d.RSSI }
       }
@@ -101,11 +115,15 @@ function discover(timeoutMs) {
         resolve(list)
         return
       }
-      // 一个都没匹配上 —— 把实际扫到的名字列出来, 一眼就能看出是"权限没给"还是"名字变了"
-      const names = Object.keys(seen).map((k) => seen[k])
-      if (names.length) {
-        reject(new Error('扫到了 ' + names.length + ' 个蓝牙设备但没一个叫 ' + NAME_PREFIX +
-          ' 开头的: ' + names.slice(0, 5).join(', ')))
+      // 一个都没匹配上 —— 把实际扫到的设备全列出来, 一眼就能看出是"权限没给"还是"名字变了"
+      const all = Object.keys(seen).map((k) => {
+        const s = seen[k]
+        const uuids = (s.uuids && s.uuids.length) ? ('[' + s.uuids.join(',') + ']') : ''
+        return (s.name || '(无名字)') + ' ' + uuids
+      })
+      if (all.length) {
+        reject(new Error('扫到了 ' + all.length + ' 个蓝牙设备, 但没有叫 ' + NAME_PREFIX +
+          ' 开头的:\n' + all.slice(0, 8).join('\n')))
       } else {
         reject(new Error('一个蓝牙设备都没扫到 —— 检查手机蓝牙是否开着, ' +
           '微信有没有蓝牙权限 (设置→隐私与安全性→蓝牙→微信), 安卓还要给定位权限'))
@@ -113,8 +131,7 @@ function discover(timeoutMs) {
     }, timeoutMs || 8000)
 
     wx.startBluetoothDevicesDiscovery({
-      services: [],
-      // interval 拉长——iOS 上扫描回应合并进结果有延迟, 扫得太密反而漏名字
+      // 不传 services! iOS 上传空数组会把没广播服务 UUID 的设备全过滤掉
       allowDuplicatesKey: true,
       interval: 1000,
       success: () => {},
@@ -125,6 +142,18 @@ function discover(timeoutMs) {
         wx.offBluetoothDevicesFound && wx.offBluetoothDevicesFound(onFound)
         reject(new Error(explainBleFail(err && err.errMsg, '开始扫描')))
       },
+    })
+  })
+}
+
+// 微信缓存里已知的蓝牙设备 (含之前连过的).
+// iOS 对同一个设备地址的 GATT 缓存很顽固 —— 之前连接失败过的话, 之后可能一直连不上.
+// 把这个列出来, 就能看出"设备在缓存里但连不上"这种 iOS 特有的坑.
+function getKnownDevices() {
+  return new Promise((resolve) => {
+    wx.getBluetoothDevices({
+      success: (res) => resolve((res && res.devices) || []),
+      fail: () => resolve([]),
     })
   })
 }
@@ -318,6 +347,7 @@ module.exports = {
   openAdapter,
   closeAdapter,
   discover,
+  getKnownDevices,
   connect,
   subscribe,
   findCharacteristic,

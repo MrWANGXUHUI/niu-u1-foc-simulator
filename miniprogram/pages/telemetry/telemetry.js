@@ -169,7 +169,17 @@ Page({
       wx.showToast({ title: '已连接', icon: 'none' })
     } catch (e) {
       this.setData({ busy: false, connected: false, statusText: '未连接' })
-      wx.showModal({ title: '连不上', content: e.message, showCancel: false })
+      // iOS 上"扫不到"有好几种原因, 光一句报错没法区分. 把微信缓存里的设备也带上:
+      // 设备在缓存里却连不上 = iOS 的 GATT 缓存卡住了 (要重启手机/删小程序重进)
+      const known = await ble.getKnownDevices()
+      const knownText = known.length
+        ? ('\n\n微信缓存里的设备: ' + known.map((d) => (d.name || '(无名字)')).join(', '))
+        : ''
+      wx.showModal({
+        title: '连不上',
+        content: e.message + knownText,
+        showCancel: false,
+      })
     }
   },
 
