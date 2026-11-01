@@ -5,6 +5,11 @@
  * 推固件才需要连热点 (OTA 走 HTTP, 1MB 多, 蓝牙传太慢).
  *
  * 安卓注意: Android 6 以后扫蓝牙要"定位"权限, 第一次会弹系统授权框, 不给就扫不到设备.
+ *
+ * ⚠️ **微信基础库版本兼容**: BLE 那套 API 是一批批加进来的, 老的微信上缺 API 会直接抛
+ * "wx.xxx is not a function" —— 曾经因为 `wx.onBluetoothDevicesFound` (2.11.0 才有)
+ * 在用户手机上不存在, 扫描回调压根没注册上, 表现为"怎么改广播包都扫不到设备".
+ * 所以这个文件里凡是用到可能缺失的 API, 都要先 typeof 检查再调, 并留兜底路径.
  */
 
 const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e'
@@ -74,20 +79,31 @@ function closeAdapter() {
 
 // 扫设备, 只留名字像我们的. 返回 [{deviceId, name, rssi}]
 //
-// ⚠️ services 参数在 iOS 上有坑: 微信的文档写"只搜索广播包有对应 UUID 的主服务的设备",
-// 但实现上 iOS 传空数组会被当成"过滤条件非空", 结果**只上报广播里带服务 UUID 的设备**.
-// 我们现在主广播包只有 Flags + 名字 (名字必须放主广播包, 见固件 ble_telemetry.h),
-// 128 位 UUID 在扫描回应里 —— 于是正好被这个过滤挡掉, iPhone 怎么扫都扫不到.
-// 所以这里**不传 services**, 扫到全部再自己在 JS 里按名字筛.
+// ⚠️ 三处 iOS / 低版本微信的坑, 都踩过:
+//
+// 1) **services 参数**: 微信文档说"只搜索广播包有对应 UUID 的主服务的设备",
+//    但 iOS 实现里传空数组会被当成"过滤条件非空", 只上报广播里带服务 UUID 的设备.
+//    我们主广播包只有 Flags + 名字 (名字必须放主广播包, 见固件 ble_telemetry.h),
+//    128 位 UUID 在扫描回应里 —— 正好被过滤掉. **所以不传 services**.
+//
+// 2) **onBluetoothDevicesFound 可能不存在**: 这个 API 是基础库 2.11.0 才加的,
+//    更老的微信只有单数的 wx.onBluetoothDeviceFound. 用户手机上报的错就是
+//    "wx.onBluetoothDevicesFound is not a function" —— 扫描回调压根没注册上,
+//    所以之前怎么改广播包都没用. **三套 API 都兼容**: 新版事件 / 旧版单数事件 /
+//    getBluetoothDevices 轮询兜底 (最老的微信只有这个).
+//
+// 3) **iOS 上微信的 BLE 扫描在后台会被系统限制**, 所以窗口给足 (>=10s).
 //
 // 顺带记下扫到的**所有**设备 (不只是匹配上的), 失败时报错里全列出来 ——
-// iPhone 上"扫不到"的原因有好几个 (权限 / iOS 缓存 / 名字没广播出来),
+// "扫不到"的原因有好几个 (权限 / iOS 缓存 / 名字没广播出来 / 基础库太老),
 // 光看一句"没找到"没法区分, 看到具体扫到了什么才行.
 function discover(timeoutMs) {
   return new Promise((resolve, reject) => {
     let done = false
     const found = {}
     const seen = {}   // 扫到的所有设备 (不管名字对不对)
+    let pollTimer = null
+    let timer = null
 
     const onFound = (res) => {
       const list = (res && res.devices) || []
@@ -101,15 +117,22 @@ function discover(timeoutMs) {
         if (!name || name.indexOf(NAME_PREFIX) !== 0) continue
         found[d.deviceId] = { deviceId: d.deviceId, name: name, rssi: d.RSSI }
       }
+      // 一找到就直接收工, 不用等满整个窗口
+      if (Object.keys(found).length) finish(true)
     }
 
-    wx.onBluetoothDevicesFound(onFound)
+    // 老版 API 的回调参数形状不一样 (单个设备, 不是 devices 数组)
+    const onFoundOld = (res) => onFound({ devices: res ? [res] : [] })
 
-    const timer = setTimeout(() => {
+    function finish() {
       if (done) return
       done = true
-      wx.offBluetoothDevicesFound && wx.offBluetoothDevicesFound(onFound)
+      if (timer) clearTimeout(timer)
+      if (pollTimer) clearInterval(pollTimer)
+      if (wx.offBluetoothDevicesFound) wx.offBluetoothDevicesFound(onFound)
+      if (wx.offBluetoothDeviceFound) wx.offBluetoothDeviceFound(onFoundOld)
       call('stopBluetoothDevicesDiscovery', {}).catch(() => {})
+
       const list = Object.keys(found).map((k) => found[k])
       if (list.length) {
         resolve(list)
@@ -128,7 +151,26 @@ function discover(timeoutMs) {
         reject(new Error('一个蓝牙设备都没扫到 —— 检查手机蓝牙是否开着, ' +
           '微信有没有蓝牙权限 (设置→隐私与安全性→蓝牙→微信), 安卓还要给定位权限'))
       }
-    }, timeoutMs || 8000)
+    }
+
+    // 注册扫描回调 —— 新版优先, 没有就用老版单数 API
+    if (typeof wx.onBluetoothDevicesFound === 'function') {
+      wx.onBluetoothDevicesFound(onFound)
+    } else if (typeof wx.onBluetoothDeviceFound === 'function') {
+      wx.onBluetoothDeviceFound(onFoundOld)
+    }
+    // 兜底: 定时拉一次已知设备列表. 有些基础库事件回调不可靠, 但这个接口一直都在.
+    pollTimer = setInterval(() => {
+      wx.getBluetoothDevices({
+        success: (res) => {
+          const list = (res && res.devices) || []
+          if (list.length) onFound({ devices: list })
+        },
+        fail: () => {},
+      })
+    }, 1500)
+
+    timer = setTimeout(finish, timeoutMs || 8000)
 
     wx.startBluetoothDevicesDiscovery({
       // 不传 services! iOS 上传空数组会把没广播服务 UUID 的设备全过滤掉
@@ -138,8 +180,10 @@ function discover(timeoutMs) {
       fail: (err) => {
         if (done) return
         done = true
-        clearTimeout(timer)
-        wx.offBluetoothDevicesFound && wx.offBluetoothDevicesFound(onFound)
+        if (timer) clearTimeout(timer)
+        if (pollTimer) clearInterval(pollTimer)
+        if (wx.offBluetoothDevicesFound) wx.offBluetoothDevicesFound(onFound)
+        if (wx.offBluetoothDeviceFound) wx.offBluetoothDeviceFound(onFoundOld)
         reject(new Error(explainBleFail(err && err.errMsg, '开始扫描')))
       },
     })
@@ -151,11 +195,49 @@ function discover(timeoutMs) {
 // 把这个列出来, 就能看出"设备在缓存里但连不上"这种 iOS 特有的坑.
 function getKnownDevices() {
   return new Promise((resolve) => {
+    if (typeof wx.getBluetoothDevices !== 'function') {
+      resolve([])
+      return
+    }
     wx.getBluetoothDevices({
       success: (res) => resolve((res && res.devices) || []),
       fail: () => resolve([]),
     })
   })
+}
+
+// 当前微信支持哪些 BLE API —— 出问题时先看这个, 一眼就知道是不是版本太老.
+// 返回缺失的 API 名字列表 (空数组 = 都支持)
+function missingApis() {
+  const need = [
+    'openBluetoothAdapter',
+    'startBluetoothDevicesDiscovery',
+    'stopBluetoothDevicesDiscovery',
+    'createBLEConnection',
+    'getBLEDeviceServices',
+    'getBLEDeviceCharacteristics',
+    'notifyBLECharacteristicValueChange',
+    'onBLECharacteristicValueChange',
+    'writeBLECharacteristicValue',
+  ]
+  const missing = []
+  for (const name of need) {
+    if (typeof wx[name] !== 'function') missing.push(name)
+  }
+  return missing
+}
+
+// 基础库版本 (比如 "3.0.0"). 老版本缺 API 时报出来, 用户能看懂该升级微信.
+function libVersion() {
+  try {
+    if (wx.getSystemInfoSync) {
+      const info = wx.getSystemInfoSync()
+      return info.SDKVersion || info.version || '未知'
+    }
+  } catch (e) {
+    // 老基础库可能没有 getSystemInfoSync
+  }
+  return '未知'
 }
 
 async function connect(deviceId) {
@@ -348,6 +430,8 @@ module.exports = {
   closeAdapter,
   discover,
   getKnownDevices,
+  missingApis,
+  libVersion,
   connect,
   subscribe,
   findCharacteristic,

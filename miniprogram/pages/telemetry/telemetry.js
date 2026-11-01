@@ -37,17 +37,27 @@ Page({
 
   onLoad() {
     this.battery = ble.createBatteryState()
-    wx.onBLECharacteristicValueChange((res) => {
-      if (!res || !res.value) return
-      const uuid = (res.characteristicId || '').toLowerCase()
-      if (uuid === ble.TELEMETRY_UUID.toLowerCase()) {
-        this.onTelemetry(res.value)
-      } else if (uuid === ble.FRAME_UUID.toLowerCase()) {
-        this.onFrame(res.value)
-      } else if (uuid === ble.BATTERY_UUID.toLowerCase()) {
-        this.onBattery(res.value)
-      }
-    })
+    // 通知回调 —— 这个 API 老微信上也有 (2.9.0), 但还是先检查再注册
+    if (typeof wx.onBLECharacteristicValueChange === 'function') {
+      wx.onBLECharacteristicValueChange((res) => {
+        if (!res || !res.value) return
+        const uuid = (res.characteristicId || '').toLowerCase()
+        if (uuid === ble.TELEMETRY_UUID.toLowerCase()) {
+          this.onTelemetry(res.value)
+        } else if (uuid === ble.FRAME_UUID.toLowerCase()) {
+          this.onFrame(res.value)
+        } else if (uuid === ble.BATTERY_UUID.toLowerCase()) {
+          this.onBattery(res.value)
+        }
+      })
+    } else {
+      wx.showModal({
+        title: '微信版本太老',
+        content: '当前微信缺少蓝牙 API (onBLECharacteristicValueChange).\n' +
+          '到应用商店把微信更新到最新版再试。',
+        showCancel: false,
+      })
+    }
   },
 
   onUnload() {
@@ -147,6 +157,14 @@ Page({
     if (this.data.busy) return
     this.setData({ busy: true, statusText: '正在搜索设备…', frames: [] })
     try {
+      // 先看基础库够不够 —— 缺 API 的话后面每个调用都会抛 "is not a function",
+      // 直接在这里说清楚, 比让人看一串天书报错强
+      const missing = ble.missingApis()
+      if (missing.length) {
+        throw new Error('当前微信 (基础库 ' + ble.libVersion() + ') 缺少这些蓝牙接口:\n' +
+          missing.join('\n') + '\n\n把微信更新到最新版再试。')
+      }
+
       await ble.openAdapter()
       const devices = await ble.discover(10000)
       const dev = devices[0]

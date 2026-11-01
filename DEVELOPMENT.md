@@ -129,6 +129,12 @@ GATT 服务把车速/转速/电压/电流和 485 原始帧推给小程序，手�
 8. **固件要定期重启广播**（没连手机时每 15 秒一次）。`advertising->start()` 有可能撞上
    GAP 状态机没准备好而被静默丢掉——代码却以为成功了，于是设备进入「活着、485 正常、
    但 BLE 再也不广播」的状态，车上没法自查。
+9. **手机端 API 要做版本兼容** ⭐ —— 这是踩过最大的坑：`wx.onBluetoothDevicesFound`
+   是**基础库 2.11.0 才有**的，用户手机上只有单数的 `wx.onBluetoothDeviceFound`，
+   扫描回调压根没注册上 → 表现为「怎么改固件的广播包都扫不到设备」。
+   现在 `discover()` 三路兜底（新版事件 / 旧版单数事件 / `getBluetoothDevices` 轮询），
+   并且点连接时先跑 `ble.missingApis()` 自检、缺什么直接列出来。
+   `project.config.json` 的 `libVersion` 也从 3.0.0 提到 3.7.12。
 
 **一个反面教训**：查 BLE 广播节奏**不能只看 btmon 的计数**——它抓的是控制器重复过滤后的上报，
 会造出「16 秒才广播一次」的假象。真实数据要用 `hcitool lescan --duplicates`（需 root，

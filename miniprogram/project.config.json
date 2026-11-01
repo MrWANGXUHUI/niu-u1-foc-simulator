@@ -3,7 +3,7 @@
   "projectname": "niu-u1-ota",
   "appid": "wx302c7b5ea803ba9e",
   "compileType": "miniprogram",
-  "libVersion": "3.0.0",
+  "libVersion": "3.7.12",
   "setting": {
     "urlCheck": false,
     "es6": true,
