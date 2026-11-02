@@ -24,7 +24,12 @@
     }
   },
   "packOptions": {
-    "ignore": [],
+    "ignore": [
+      {
+        "type": "suffix",
+        "value": ".js.map"
+      }
+    ],
     "include": []
   },
   "condition": {},

@@ -11,7 +11,9 @@
   <view class="tip err" wx:if="{{connectError}}">{{connectError}}</view>
 </view>
 
-<!-- ============ 已连接 ============ -->
+<!-- 已连接.
+     ⚠️ 注释必须放在 block 里面, 不能夹在 wx:if 和 wx:else 中间 ——
+     wx:else 只能紧跟在 wx:if 元素后面当兄弟节点. -->
 <block wx:else>
 
   <!-- 连接条: 一直可见, 不用滚到底才知道连没连上 -->
