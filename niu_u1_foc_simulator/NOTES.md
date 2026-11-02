@@ -427,7 +427,7 @@ OTA 期间 OLED 切到 OTA 画面 (SSID + IP + 进度条), 完成后恢复速度
 而点左上角「首页」走的是 `pages[0]` (`pages/vehicle/vehicle`), 所以是好的 ——
 **这个差别就是判断依据: 首页能进、默认进不去 = 默认路径是陈旧的.**
 
-**修法: 旧路径留着同名空页, 进来就跳到新页面.**
+**修法: 旧路径留着同名空页, 进来就跳到新的默认首页.**
 `pages/telemetry/telemetry` 和 `pages/index/index` 现在都只是跳板:
 
 ```js
@@ -439,6 +439,12 @@ Page({
 ```
 
 注意 **tabBar 页面只能用 `wx.switchTab` 跳**, `redirectTo`/`navigateTo` 跳不过去.
+
+> ⚠️ **跳板要跳「车辆」, 不是跳「升级」**.
+> 旧版 `app.json` 的 `pages[0]` 是 `pages/index/index` —— 也就是说公众平台记下来的
+> 「小程序主页」正是这个路径, 所以**默认打开走的就是它**.
+> 一开始我把 `pages/index/index` 跳到了「升级」, 结果用户默认打开落在升级页上,
+> 而新的 `pages[0]` 是「车辆」. 跳板必须跟新的默认首页保持一致.
 
 > 顺带: 排查这个的时候, 上传日志里只列 `.js/.wxml/.wxss`, **看不到编译器重新生成的 app.json**
 > (它是由 `app.json` + 页面 json 重新拼出来的). 用 `tools/dump_appjson.js` 本地跑一遍编译,
