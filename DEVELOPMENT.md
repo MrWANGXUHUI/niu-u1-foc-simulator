@@ -171,6 +171,84 @@ BMS 的应答我们在旁边也收得到 —— 于是把它解析出来推给�
 
 ---
 
+## 9. 小程序界面重构（2026-11-02 加）
+
+原来一个小程序里塞了「遥测看板」+「固件升级」两件事，页面逻辑绕：想升级得先翻到
+页面底部找输入框，想看车速得先跳过一堆升级控件。拆成两个 tab：
+
+| tab | 页面 | 干什么 |
+|---|---|---|
+| 车辆（默认） | `pages/vehicle/vehicle` | 连蓝牙 → 大字车速 → 转速/电压/电流/错误码 → 电池 → 折叠的诊断和 485 原始帧 |
+| 升级 | `pages/upgrade/upgrade` | 三步引导：①蓝牙开热点 → ②手机连热点 → ③传固件 |
+
+**核心改动：蓝牙连接提到全局单例**（`miniprogram/utils/bleLink.js`）。
+
+两个页面都要蓝牙。连接状态如果只存在页面里，两个页面各连一次、互相踢掉，
+用户完全搞不清发生了什么。现在 `bleLink` 管连接，页面只订阅：
+
+```js
+const unsubState = bleLink.onState((s) => { ... })   // 连接状态
+const unsubData  = bleLink.onData((kind, v) => { ... }) // 遥测/帧/电池/命令
+```
+
+顺带修掉一个老 bug：通知回调（`wx.onBLECharacteristicValueChange`）原来在页面
+`onLoad` 里注册但 `onUnload` 没注销 —— 页面来回进出就会重复注册，同一批数据被处理多次。
+现在统一在 `bleLink` 里注册一次，按特征 UUID 分发给订阅者。
+
+**升级页为什么是三步**：OTA 里混着两类动作 —— 「设备开热点」是设备自己的动作，
+「手机连热点」是用户必须手动做的动作。混在一个按钮里用户不知道该干嘛。
+拆成三步后每一步都有明确的完成标志：
+
+- ① 的完成标志是**蓝牙命令写成功**，不是 HTTP 探测 —— 手机这时还没连热点，没有
+  `192.168.4.x` 网段，HTTP 必然通不了，分不清是「热点没开」还是「手机没连热点」。
+- ② 用 HTTP 探测 `/ota/info` 判断手机连上热点没有（小程序读不到手机的 WiFi 状态，只能探）。
+- ③ 传完固件，**成功标志是 `ota.end()` 返回那一刻**，不是之后的探测 ——
+  设备重启后 WiFi 默认关，探测必然失败。
+
+**升级完成后设备重启、热点自动关**，所以页面把 `info` 清掉（按钮自动变灰），
+并提示「去车辆页确认版本」—— 蓝牙不受影响，车辆页能问到新版本号。
+
+固件侧配套加了 `'V'` 命令（`0x56`）：小程序写一个字节，固件回 `['V', "1.4.2"]`。
+平时 WiFi 是关的，问不到 `/ota/info`，只有蓝牙这条路能问版本。
+
+---
+
+## 10. 一个把自己绕进去的 bug：printf 参数错位（2026-11-02）
+
+**症状**：`GET /ota/info` 一发，板子立刻 Guru Meditation 重启。OTA 第一步就断。
+
+```
+Guru Meditation Error: Core 0 panic'ed (Load access fault). Exception was unhandled.
+MCAUSE : 0x00000005   MTVAL : 0x00000001
+```
+
+`MTVAL = 0x1` 是关键：**有个 `%s` 吃到了一个整数 `1`，把它当指针解引用了**。
+
+根因是 `/ota/info` 的 JSON 用 `snprintf` 拼，格式串末尾加了 `"apOn":%d`，
+但新参数 `(int)apOn_` 被**插在了参数列表第 5 位**而不是最后，于是整体错位一格：
+
+| 位置 | 格式串要的 | 实际传进去的 |
+|---|---|---|
+| 5 | `%s` (state) | `(int)apOn_` = **1** ← 当成 `char*` 去读地址 `0x1` |
+| 6 | `%u` (progress) | `stateName()`（`char*`） |
+
+`snprintf` 是变参函数，**类型对不上编译器不报错**，只能运行时炸。
+
+**查这个 bug 走的弯路（值得记下来）**：panic 栈底有一堆 `mbedtls_sha256` /
+`esp_sha_dma` / `gdma_connect` 的帧，看着像「WiFi 加密硬件跟 SHA 抢 GDMA 通道」。
+**那是假线索** —— FreeRTOS 会复用任务栈，那几帧是 WiFi 任务之前留下的旧数据。
+判断依据：把 `ESP.getSketchSize()`（它内部确实会 `esp_image_verify()` 算 SHA）去掉之后，
+**崩溃地址一点没变**（`MEPC` 还是 `0x40058e94`）。
+
+有效的二分办法：加几个只拼一部分参数的临时路由逐个测 —— 结果每个参数单独拼都不崩，
+全部拼一起才崩，才反应过来是错位。
+
+**怎么防**：参数顺序跟格式串一一对应，每个参数后面加注释标明对应哪个占位符。
+另外顺手把 `ESP.getSketchSize()` 换成直接查分区表 —— 那个函数每次调用都要把
+1.5MB 的镜像 SHA256 重算一遍，又慢又跟 WiFi 加密抢硬件通道。
+
+---
+
 ## 已移除的功能
 
 ### BLE 防丢器接近解锁（2026-10-20 移除）
@@ -241,11 +319,12 @@ niu/
 ├── miniprogram/                # 微信小程序 (OTA 客户端 + BLE 遥测)
 │   ├── app.js app.json app.wxss
 │   ├── project.config.json sitemap.json
-│   ├── pages/index/            # 固件升级页
-│   ├── pages/telemetry/        # 车辆状态页 (BLE 车速 + 电池信息)
+│   ├── pages/vehicle/          # 车辆页 (默认 tab): BLE 车速 + 电池 + 诊断
+│   ├── pages/upgrade/          # 升级页: 三步引导 (蓝牙开热点 → 连热点 → 传固件)
 │   ├── utils/ota.js            # 分块上传
 │   ├── utils/firmware.js       # 取固件 (内置模块 / 微信聊天选文件)
 │   ├── utils/ble.js            # BLE 连接 + 订阅 + 电池消息分片重组
+│   ├── utils/bleLink.js        # 全局 BLE 连接单例 (两个页面共享一条连接)
 │   ├── utils/lz.js             # 固件解压 (配套 tools/lz_pack.py)
 │   └── firmware/firmware.js    # 构建产物 (压缩+base64 固件), 不入库
 ├── tools/
@@ -253,6 +332,7 @@ niu/
 │   ├── lz_pack.py              # 固件压缩 (极简 LZ77)
 │   ├── flash.sh                # 刷机 (擦 otadata + bootloader + 分区表 + app)
 │   ├── ota_push_test.sh        # curl 模拟小程序的端到端 OTA 测试
+│   ├── ota_open_ap.sh          # 蓝牙开热点 + 电脑连上去 (OTA 测试前置)
 │   └── upload_miniprogram.sh   # miniprogram-ci 上传 / 预览二维码
 └── niu_u1_foc_simulator/
     ├── platformio.ini

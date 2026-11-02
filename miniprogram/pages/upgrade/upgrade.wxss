@@ -1,0 +1,78 @@
+/* ============ 三步引导 ============ */
+
+.step {
+  border-left: 6rpx solid #2f2f36;
+}
+
+.step.doing {
+  border-left-color: #d29922;
+}
+
+.step.done {
+  border-left-color: #3fb950;
+}
+
+.step-head {
+  display: flex;
+  align-items: center;
+  padding-bottom: 8rpx;
+}
+
+.step-no {
+  width: 40rpx;
+  height: 40rpx;
+  border-radius: 50%;
+  background: #2f2f36;
+  color: #8e8e96;
+  font-size: 24rpx;
+  line-height: 40rpx;
+  text-align: center;
+  margin-right: 16rpx;
+}
+
+.step-no.doing {
+  background: #d29922;
+  color: #16161a;
+}
+
+.step-no.done {
+  background: #3fb950;
+  color: #16161a;
+}
+
+.step-title {
+  flex: 1;
+  font-size: 30rpx;
+  color: #e8e8ea;
+}
+
+.step-mark {
+  font-size: 30rpx;
+  color: #3fb950;
+}
+
+.step-body {
+  padding-top: 12rpx;
+}
+
+/* 折叠标题 */
+.src-btns {
+  display: flex;
+  margin-top: 12rpx;
+}
+
+.src-btn {
+  font-size: 24rpx;
+  padding: 0 18rpx;
+  margin-right: 12rpx;
+  line-height: 2.2;
+}
+
+.progress-wrap {
+  margin: 20rpx 0 8rpx;
+}
+
+.bar {
+  margin: 12rpx 0;
+}
+

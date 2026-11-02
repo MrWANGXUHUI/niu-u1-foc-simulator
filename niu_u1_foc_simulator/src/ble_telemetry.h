@@ -67,6 +67,7 @@ public:
     // 命令集 —— 单字节, 大写字母好认 (小程序日志里能直接看到)
     static const uint8_t CMD_START_AP  = 'W';   // 临时开 OTA 热点 (推固件用)
     static const uint8_t CMD_STOP_AP   = 'X';   // 关热点, 射频还给蓝牙
+    static const uint8_t CMD_VERSION   = 'V';   // 问固件版本号
     // 回执状态码
     static const uint8_t REPLY_DONE      = 1;
     static const uint8_t REPLY_NOSUPPORT = 0xFF;
@@ -187,9 +188,26 @@ public:
         cmdChar_->notify();
     }
 
+    // 版本号回执: [0]='V' [1..]=版本字符串 (ASCII, 不含结尾 0)
+    // 小程序在车辆页显示这个, 不用连 WiFi 就能知道板上跑的是哪一版
+    void notifyVersion(const char* ver) {
+        if (!cmdChar_ || !connected_ || !ver) return;
+        size_t n = strlen(ver);
+        if (n > 18) n = 18;                    // 20 字节通知里留 2 字节头
+        uint8_t b[20];
+        b[0] = BleCommand::CMD_VERSION;
+        memcpy(b + 1, ver, n);
+        cmdChar_->setValue(b, n + 1);
+        cmdChar_->notify();
+    }
+
     // 命令执行的钩子 —— 主程序 (.ino) 注入真正的 WiFi 开关实现, 该头不依赖 ota_server.h
     typedef void (*ApToggleFn)(bool on);
     void setApToggle(ApToggleFn fn) { apToggle_ = fn; }
+
+    // 版本号的提供者 —— 主程序 (.ino) 注入 (ota_config.h 里的 OTA_FW_VERSION)
+    typedef void (*VersionFn)(char* out, size_t cap);
+    void setVersionProvider(VersionFn fn) { versionFn_ = fn; }
 
     bool cmdPending() const { return cmdPending_; }
 
@@ -203,7 +221,15 @@ public:
         if (cmdPending_) {
             uint8_t cmd = cmdByte_;
             cmdPending_ = false;
-            if (apToggle_) {
+            if (cmd == BleCommand::CMD_VERSION) {
+                if (versionFn_) {
+                    char ver[20] = {0};
+                    versionFn_(ver, sizeof(ver));
+                    notifyVersion(ver);
+                } else {
+                    notifyReply(cmd, BleCommand::REPLY_NOSUPPORT);
+                }
+            } else if (apToggle_) {
                 apToggle_(cmd == BleCommand::CMD_START_AP);
                 notifyReply(cmd, BleCommand::REPLY_DONE);
             } else {
@@ -365,6 +391,7 @@ private:
     uint8_t cmdByte_ = 0;
     bool cmdPending_ = false;
     ApToggleFn apToggle_ = nullptr;
+    VersionFn versionFn_ = nullptr;
     BleTelemetryData data_ = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     BmsInfo bms_ = {0};
     uint16_t lastCellsHash_ = 0;

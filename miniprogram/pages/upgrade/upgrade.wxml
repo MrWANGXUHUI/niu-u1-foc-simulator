@@ -1,0 +1,144 @@
+<!-- 设备状态: 一眼看到现在跑到哪一版 -->
+<view class="card">
+  <view class="row">
+    <text class="label">固件版本</text>
+    <text class="value">{{bleVersion ? 'v' + bleVersion : (deviceVersion ? 'v' + deviceVersion : '未知')}}</text>
+  </view>
+  <view class="row" wx:if="{{info}}">
+    <text class="label">分区 / 剩余内存</text>
+    <text class="value">{{info.slot}} / {{heapText}}</text>
+  </view>
+  <view class="row">
+    <text class="label">蓝牙</text>
+    <text class="value">{{bleConnected ? '已连接' : '未连接 (在「车辆」页连)'}}</text>
+  </view>
+</view>
+
+<!-- ============ 三步引导 ============ -->
+
+<!-- ① 打开热点 -->
+<view class="card step {{stepAp}}">
+  <view class="step-head">
+    <text class="step-no {{stepAp}}">1</text>
+    <text class="step-title">让设备打开 WiFi 热点</text>
+    <text class="step-mark" wx:if="{{stepAp === 'done'}}">✓</text>
+  </view>
+  <view class="step-body">
+    <block wx:if="{{!bleConnected}}">
+      <view class="tip">
+        设备平时不开 WiFi (省电, 而且手机连上热点就断网). 升级时才临时打开,
+        推完固件重启就自动关掉.
+        \n先在「车辆」页连上蓝牙, 这一步才能用.
+      </view>
+      <button class="ghost" bindtap="goVehicle">去连蓝牙</button>
+    </block>
+    <block wx:elif="{{bleConnected && !hasCommand}}">
+      <view class="tip">
+        设备固件比较老 (1.4.0 之前), 热点默认就是开的 —— 这步跳过.
+        \n手机直接去「设置 → WiFi」连 {{apSsid}} 就能升级.
+      </view>
+      <view class="row">
+        <text class="label">热点</text>
+        <text class="value mono">{{apSsid}}</text>
+      </view>
+    </block>
+    <block wx:else>
+      <view class="tip">
+        设备平时不开 WiFi (省电, 而且手机连上热点就断网). 升级时才临时打开,
+        推完固件重启就自动关掉.
+      </view>
+      <button class="primary" bindtap="startAp" disabled="{{stepAp === 'doing' || stepAp === 'done'}}">
+        {{stepAp === 'done' ? '热点已开' : (stepAp === 'doing' ? '正在打开…' : '用蓝牙开热点')}}
+      </button>
+    </block>
+  </view>
+</view>
+
+<!-- ② 手机连热点 -->
+<view class="card step {{stepWifi}}">
+  <view class="step-head">
+    <text class="step-no {{stepWifi}}">2</text>
+    <text class="step-title">手机连上这个热点</text>
+    <text class="step-mark" wx:if="{{stepWifi === 'done'}}">✓</text>
+  </view>
+  <view class="step-body">
+    <view class="row">
+      <text class="label">热点名</text>
+      <text class="value mono">{{apSsid}}</text>
+    </view>
+    <view class="row">
+      <text class="label">密码</text>
+      <text class="value mono">{{apPassword}}</text>
+    </view>
+    <button class="ghost" bindtap="copyApInfo">复制热点名和密码</button>
+    <view class="tip">
+      去手机「设置 → WiFi」连上 <text class="mono">{{apSsid}}</text>.
+      连上以后本页会自己接上, 不用回来点任何按钮.
+      \n注意: 连上之后手机会断网 (这是热点没有外网), 传完固件手动切回自己的 WiFi.
+    </view>
+    <button class="ghost" style="margin-top:16rpx" bindtap="onProbe">重新检测一下</button>
+  </view>
+</view>
+
+<!-- ③ 传固件 -->
+<view class="card step {{stepSend}}">
+  <view class="step-head">
+    <text class="step-no {{stepSend}}">3</text>
+    <text class="step-title">传固件</text>
+    <text class="step-mark" wx:if="{{stepSend === 'done'}}">✓</text>
+  </view>
+  <view class="step-body">
+    <view class="row">
+      <text class="label">要刷的固件</text>
+      <text class="value">{{firmware ? (useCustom ? '自定义文件' : '内置') : '无'}}</text>
+    </view>
+    <view class="row" wx:if="{{firmware}}">
+      <text class="label">版本 / 大小</text>
+      <text class="value">{{firmware.version}} · {{sizeText}}</text>
+    </view>
+    <view class="src-btns">
+      <button class="ghost src-btn" bindtap="loadBuiltin" disabled="{{busy}}">用内置固件</button>
+      <button class="ghost src-btn" bindtap="pickFile" disabled="{{busy}}">从微信选文件</button>
+    </view>
+
+    <view class="progress-wrap" wx:if="{{busy || phaseText}}">
+      <view class="row">
+        <text class="label">{{phaseText || '进度'}}</text>
+        <text class="value">{{progress}}%</text>
+      </view>
+      <progress class="bar" percent="{{progress}}" stroke-width="10" color="#1a7f37" activeColor="#1a7f37" />
+      <view class="row">
+        <text class="label">已传</text>
+        <text class="value">{{sentText}} / {{sizeText}}  {{speedText}}</text>
+      </view>
+    </view>
+
+    <button class="primary" bindtap="startUpdate" disabled="{{busy || !firmware || !info}}">
+      {{busy ? '升级中…' : (stepSend === 'done' ? '再刷一次' : '开始升级')}}
+    </button>
+    <view class="tip" wx:if="{{!info}}">
+      等第 2 步连上热点后这里就能刷了. 传 1.5MB 大概要一分钟, 别锁屏.
+    </view>
+  </view>
+</view>
+
+<!-- 升级完成后的收尾: 设备重启后热点自动关了, 只能靠蓝牙确认 -->
+<view class="card" wx:if="{{upgraded}}">
+  <view class="tip">
+    设备已经重启, 新固件生效了. 设备重启后热点会自动关掉 (省电),
+    但蓝牙不受影响 —— 去「车辆」页能看到新版本号和实时车速.
+    \n想再刷一次的话, 重新走一遍上面的第 ①② 步 (蓝牙开热点 → 手机连热点).
+  </view>
+  <button class="ghost" bindtap="goVehicle">去车辆页确认版本</button>
+</view>
+
+<!-- 日志: 折叠 -->
+<view class="card">
+  <view class="fold-head" bindtap="toggleLog">
+    <text class="label">日志</text>
+    <text class="fold-arrow">{{showLog ? '收起 ▾' : '展开 ▸'}}</text>
+  </view>
+  <scroll-view wx:if="{{showLog}}" class="log" scroll-y scroll-into-view="{{logAnchor}}" scroll-with-animation>
+    <view wx:for="{{logs}}" wx:key="index" id="log{{index}}" class="log-line">{{item}}</view>
+  </scroll-view>
+</view>

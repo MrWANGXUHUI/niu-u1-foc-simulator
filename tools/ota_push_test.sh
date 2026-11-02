@@ -62,8 +62,14 @@ echo "==> 传输完成, POST /ota/end"
 curl -s --max-time 20 -X POST "$BASE/ota/end"
 echo
 
-echo "==> 等设备重启 (5 秒)..."
-sleep 5
+# 设备重启后 WiFi 是**默认关**的 (ota_config.h 的 OTA_AP_DEFAULT_OFF),
+# 所以这里不能再直接 GET —— 得先用蓝牙 'W' 把热点重新开起来.
+# 这也正是小程序升级完的流程: 设备重启 → 热点自动关 → 蓝牙还能用.
+echo "==> 等设备重启 (8 秒)..."
+sleep 8
+echo "==> 用蓝牙重新开热点 (设备重启后 WiFi 默认关)"
+bash "$ROOT/tools/ota_open_ap.sh" || { echo "!! 蓝牙开热点失败 —— 板子是不是没起来?"; exit 1; }
+
 echo "==> 再次 GET /ota/info"
 NEW=$(curl -s --max-time 10 "$BASE/ota/info")
 echo "    $NEW"

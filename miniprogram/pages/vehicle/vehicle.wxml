@@ -1,0 +1,140 @@
+<!-- ============ 未连接: 明确的引导, 而不是一屏 0.0 ============ -->
+<view class="card" wx:if="{{!connected}}">
+  <view class="big-status">还没连上车</view>
+  <view class="tip">
+    点下面按钮通过蓝牙连接 ESP32. 蓝牙直连, 不用连 WiFi 热点, 手机照常上网.
+    \n安卓手机第一次会要「定位」权限, 不给就扫不到设备.
+  </view>
+  <button class="primary" bindtap="onConnect" disabled="{{busy}}" loading="{{busy}}">
+    {{busy ? '正在搜索设备…' : '连接设备'}}
+  </button>
+  <view class="tip err" wx:if="{{connectError}}">{{connectError}}</view>
+</view>
+
+<!-- ============ 已连接 ============ -->
+<block wx:else>
+
+  <!-- 连接条: 一直可见, 不用滚到底才知道连没连上 -->
+  <view class="conn-bar">
+    <view class="conn-left">
+      <view class="dot"></view>
+      <text class="conn-text">{{statusText}}</text>
+      <text class="conn-dev" wx:if="{{deviceName}}">{{deviceName}}</text>
+      <text class="conn-ver" wx:if="{{fwVersion}}">v{{fwVersion}}</text>
+    </view>
+    <text class="link-btn" bindtap="onDisconnect">断开</text>
+  </view>
+
+  <!-- 车速: 第一眼要看到的东西 -->
+  <view class="card">
+    <view class="speed-wrap">
+      <text class="speed">{{speed}}</text>
+      <text class="unit">km/h</text>
+    </view>
+    <view class="stat-row">
+      <view class="stat">
+        <text class="stat-label">转速</text>
+        <text class="stat-value">{{rpm}}</text>
+        <text class="stat-unit">RPM</text>
+      </view>
+      <view class="stat">
+        <text class="stat-label">电压</text>
+        <text class="stat-value">{{voltage}}</text>
+        <text class="stat-unit">V</text>
+      </view>
+      <view class="stat">
+        <text class="stat-label">电流</text>
+        <text class="stat-value">{{current}}</text>
+        <text class="stat-unit">A</text>
+      </view>
+      <view class="stat">
+        <text class="stat-label">{{unlockedText}}</text>
+        <text class="stat-value" wx:if="{{errorCode}}" style="color:#f85149">{{errorCode}}</text>
+        <text class="stat-unit" wx:else>—</text>
+      </view>
+    </view>
+  </view>
+
+  <!-- 电池 -->
+  <view class="card">
+    <view class="fold-head">
+      <text class="label">电池</text>
+      <text class="fold-hint" wx:if="{{bmsHasData}}">{{soc}}%</text>
+    </view>
+    <view wx:if="{{!bmsHasData}}" class="tip">
+      没收到电池报文 —— BMS 只在 V35 轮询它的时候才回话, 车得通电才行.
+    </view>
+    <block wx:if="{{bmsHasData}}">
+      <view class="soc-bar"><view class="soc-fill" style="width:{{socWidth}}"></view></view>
+      <view class="row">
+        <text class="label">总电压 / 电流</text>
+        <text class="value">{{bmsVoltage}} V / {{bmsCurrent}} A</text>
+      </view>
+      <view class="row" wx:if="{{bmsTemps}}">
+        <text class="label">温度</text>
+        <text class="value">{{bmsTemps}}</text>
+      </view>
+      <view class="row" wx:if="{{cellCount}}">
+        <text class="label">单体电压</text>
+        <text class="value">{{cellCount}} 串 {{cellRange}}</text>
+      </view>
+      <view class="row" wx:if="{{bmsModel}}">
+        <text class="label">电池型号</text>
+        <text class="value">{{bmsModel}}</text>
+      </view>
+      <view class="cell-bars" wx:if="{{cellBars.length}}">
+        <view class="cell-bar" wx:for="{{cellBars}}" wx:key="i">
+          <view class="cell-fill" style="height:{{item.h}}"></view>
+          <text class="cell-text mono">{{item.v}}</text>
+        </view>
+      </view>
+    </block>
+  </view>
+
+  <!-- 诊断: 折叠起来. 排查问题时点开, 平时不占地方 -->
+  <view class="card">
+    <view class="fold-head" bindtap="toggleDiag">
+      <text class="label">诊断</text>
+      <text class="fold-arrow">{{showDiag ? '收起 ▾' : '展开 ▸'}}</text>
+    </view>
+    <block wx:if="{{showDiag}}">
+      <view class="row">
+        <text class="label">V35 轮询 / 应答</text>
+        <text class="value">{{qCount}} / {{aCount}}</text>
+      </view>
+      <view class="row">
+        <text class="label">轮询速率</text>
+        <text class="value">{{pollHz}}</text>
+      </view>
+      <view class="row">
+        <text class="label">霍尔脉冲 / 间隔</text>
+        <text class="value">{{pulseCount}} / {{intervalMs}} ms</text>
+      </view>
+      <view class="row" wx:if="{{badCs}}">
+        <text class="label">校验和错帧</text>
+        <text class="value">{{badCs}}</text>
+      </view>
+      <view class="tip">
+        轮询数一直涨 = 总线通; 应答数跟着涨 = 我们答上了 (两个数应该相等);
+        脉冲数不涨 = 霍尔/磁钢没信号, 车速自然是 0.
+      </view>
+    </block>
+  </view>
+
+  <!-- 485 原始帧: 折叠. 有问题才看 -->
+  <view class="card">
+    <view class="fold-head" bindtap="toggleFrames">
+      <text class="label">485 总线原始帧</text>
+      <text class="fold-arrow">{{showFrames ? '收起 ▾' : '展开 ▸'}}</text>
+    </view>
+    <block wx:if="{{showFrames}}">
+      <view wx:if="{{!frames.length}}" class="tip">
+        还没收到帧 —— 车上的 ECU 得在轮询 FOC 才会出现.
+      </view>
+      <scroll-view class="log" scroll-y>
+        <view wx:for="{{frames}}" wx:key="*this" class="log-line mono">{{item}}</view>
+      </scroll-view>
+    </block>
+  </view>
+
+</block>

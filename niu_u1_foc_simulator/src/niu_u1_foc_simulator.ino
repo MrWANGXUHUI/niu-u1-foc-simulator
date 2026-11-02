@@ -523,6 +523,16 @@ static void bleApToggle(bool on) {
 #endif
 #endif
 
+#if BLE_ENABLE
+// 小程序在「车辆」页要显示当前固件版本. 平时 WiFi 是关的, 问不到 /ota/info,
+// 所以走蓝牙: 小程序写一个 'V', 这里把版本号回过去.
+static void bleVersionProvider(char* out, size_t cap) {
+    if (!out || cap == 0) return;
+    strncpy(out, OTA_FW_VERSION, cap - 1);
+    out[cap - 1] = '\0';
+}
+#endif
+
 static uint8_t rx_buf[256];
 static size_t rx_len = 0;
 static unsigned long last_debug = 0;
@@ -834,6 +844,7 @@ void setup() {
 #if OTA_AP_ENABLE
     bleTelemetry.setApToggle(&bleApToggle);
 #endif
+    bleTelemetry.setVersionProvider(&bleVersionProvider);
     Serial.printf("[MEM] BLE 之后 free=%d\n", esp_get_free_heap_size()); Serial.flush();
 #endif
 

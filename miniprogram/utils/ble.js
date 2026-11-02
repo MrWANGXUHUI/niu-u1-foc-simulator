@@ -22,6 +22,7 @@ const NAME_PREFIX = 'NIU-U1'
 // 命令字节 —— 对应固件 ble_telemetry.h 的 BleCommand
 const CMD_START_AP = 'W'   // 临时开 OTA 热点
 const CMD_STOP_AP = 'X'    // 关热点
+const CMD_VERSION = 'V'    // 问固件版本号 (回包第一字节还是 'V', 后面跟版本字符串)
 
 // 电池消息类型 —— 对应固件 ble_telemetry.h 的 BLE_BMSG_*
 const BMSG_STATUS = 1
@@ -341,6 +342,27 @@ function bufferToHex(buffer) {
 }
 
 /**
+ * 解析命令特征的回执.
+ *
+ * 固件有两种回包 (ble_telemetry.h 的 notifyReply / notifyVersion):
+ *   [cmd][state]      —— 普通命令, state: 0x01 已执行 / 0xFF 不认识
+ *   ['V'][ASCII 版本] —— 版本号
+ *
+ * 返回 {cmd, state, version}. 版本那条的 state 恒为 null.
+ */
+function parseCmdReply(buffer) {
+  if (!buffer || !buffer.byteLength) return null
+  const bytes = new Uint8Array(buffer)
+  const cmd = String.fromCharCode(bytes[0])
+  if (cmd === CMD_VERSION) {
+    let ver = ''
+    for (let i = 1; i < bytes.length; i++) ver += String.fromCharCode(bytes[i])
+    return { cmd: cmd, state: null, version: ver.replace(/\0/g, '').trim() }
+  }
+  return { cmd: cmd, state: bytes.length > 1 ? bytes[1] : null, version: '' }
+}
+
+/**
  * 电池信息 —— 一条特征上跑多种消息, 每条通知带 3 字节头 [类型][片号][总片数].
  * 分片是因为单条通知最多 20 字节, 而 13 串单体电压就有 26 字节.
  *
@@ -426,6 +448,7 @@ module.exports = {
   NAME_PREFIX,
   CMD_START_AP,
   CMD_STOP_AP,
+  CMD_VERSION,
   openAdapter,
   closeAdapter,
   discover,
@@ -438,6 +461,7 @@ module.exports = {
   writeCommand,
   parseTelemetry,
   bufferToHex,
+  parseCmdReply,
   createBatteryState,
   handleBatteryChunk,
 }

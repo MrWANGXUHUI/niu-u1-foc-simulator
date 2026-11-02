@@ -1,10 +1,26 @@
 {
-  "pages": ["pages/index/index", "pages/telemetry/telemetry"],
+  "pages": ["pages/vehicle/vehicle", "pages/upgrade/upgrade"],
   "window": {
     "backgroundTextStyle": "dark",
     "navigationBarBackgroundColor": "#16161a",
     "navigationBarTitleText": "小牛 U1",
     "navigationBarTextStyle": "white"
+  },
+  "tabBar": {
+    "color": "#8e8e96",
+    "selectedColor": "#7ee787",
+    "backgroundColor": "#1c1c21",
+    "borderStyle": "black",
+    "list": [
+      {
+        "pagePath": "pages/vehicle/vehicle",
+        "text": "车辆"
+      },
+      {
+        "pagePath": "pages/upgrade/upgrade",
+        "text": "升级"
+      }
+    ]
   },
   "style": "v2",
   "sitemapLocation": "sitemap.json"

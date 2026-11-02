@@ -64,11 +64,21 @@ ESP32 开一个 WiFi 热点，手机连上它，**微信小程序通过局域网
 ```
 
 - 固件端：`niu_u1_foc_simulator/src/ota_server.h`（接口表见 [NOTES.md](niu_u1_foc_simulator/NOTES.md) 第 6 节）
-- 小程序端：`miniprogram/`
-- 端到端验证（不用手机）：`bash tools/ota_push_test.sh`
+- 小程序端：`miniprogram/` 的「升级」页
+- 端到端验证（不用手机）：`bash tools/ota_push_test.sh`（台架已跑通：1.59MB 全传完，运行分区 app0 → app1）
 - 上传体验版 / 预览二维码：`bash tools/upload_miniprogram.sh preview|upload`（需要 AppID + 上传私钥）
 
 > 分区表已改成 A/B 双槽（每槽 1.75MB），**必须全量重刷一次**（`tools/flash.sh`）之后 OTA 才可用。
+
+### 小程序长什么样（v1.4.2 起）
+
+两个 tab：
+
+- **车辆**（默认）—— 连蓝牙 → 大字车速 → 转速/电压/电流/错误码 → 电池 → 折叠的诊断和 485 原始帧
+- **升级** —— 三步引导：① 用蓝牙开热点 → ② 手机连热点 → ③ 传固件
+
+蓝牙连接是**全局共享**的（`miniprogram/utils/bleLink.js`），两个页面用同一条连接，
+不会出现「在升级页连了、回到车辆页又断了」的情况。
 
 ## BLE 遥测（看车速不用连 WiFi）
 
@@ -78,9 +88,10 @@ GATT 服务把**车速 / 转速 / 电压 / 电流 / 协议车速 / 错误码**�
 
 - 服务 UUID `6e400001-b5a3-f393-e0a9-e50e24dcca9e`，遥测特征 `…0002`，原始帧特征 `…0003`，电池特征 `…0004`，命令特征 `…0005`
 - 遥测 5 Hz（200ms）主动通知；原始帧按 20 字节一节推送，小程序按帧尾 `0x16` 拼回整帧
-- 命令特征 `…0005`（write）：`0x57` 开 OTA 热点、`0x58` 关热点 —— 蓝牙优先架构的遥控器
+- 命令特征 `…0005`（write）：`0x57` 开 OTA 热点、`0x58` 关热点 —— 蓝牙优先架构的遥控器；
+  `0x56` 问固件版本号（平时 WiFi 关着，只有蓝牙能问版本）
 - 固件侧：`niu_u1_foc_simulator/src/ble_telemetry.h`
-- 小程序侧：`miniprogram/pages/telemetry/`（大号车速 + 电池面板 + 485 帧滚动列表）
+- 小程序侧：`miniprogram/pages/vehicle/`（大号车速 + 电池面板 + 485 帧滚动列表）
 
 > **设备名必须放在主广播包里**（v1.4.0 起）。库默认把名字塞扫描回应，而 iPhone 后台的小程序
 > 是**被动扫描**、收不到扫描回应，看到的就是「没名字的设备」被按名字过滤掉。
@@ -133,11 +144,12 @@ niu/
 │       ├── diagram.svg
 │       └── diagram.png
 ├── miniprogram/                    # 微信小程序（OTA 客户端 + BLE 遥测）
-│   ├── pages/index/                # 固件升级页
-│   ├── pages/telemetry/            # 车辆状态页（BLE 车速 / 485 帧）
+│   ├── pages/vehicle/              # 车辆页（默认 tab）：BLE 车速 / 电池 / 485 帧
+│   ├── pages/upgrade/              # 升级页：三步引导（开热点 → 连热点 → 传固件）
 │   ├── utils/ota.js                # 分块上传
 │   ├── utils/firmware.js           # 取固件（内置压缩模块 / 微信聊天选文件）
 │   ├── utils/ble.js                # BLE 连接 + 订阅 + 解析（含电池消息分片重组）
+│   ├── utils/bleLink.js            # 全局 BLE 连接单例（两个页面共享一条连接）
 │   ├── utils/lz.js                 # 固件解压（配套 tools/lz_pack.py）
 │   └── firmware/firmware.js        # 构建产物（压缩+base64 固件），不入库
 ├── tools/
@@ -145,6 +157,7 @@ niu/
 │   ├── lz_pack.py                  # 固件压缩（极简 LZ77）
 │   ├── flash.sh                    # 刷机（擦 otadata + bootloader + 分区表 + app）
 │   ├── ota_push_test.sh            # curl 模拟小程序的端到端 OTA 测试
+│   ├── ota_open_ap.sh              # 蓝牙开热点 + 电脑连上去（OTA 测试前置）
 │   └── upload_miniprogram.sh       # miniprogram-ci 上传 / 预览二维码
 └── niu_u1_foc_simulator/           # PlatformIO 工程
     ├── platformio.ini
@@ -161,9 +174,10 @@ niu/
         └── bms_protocol.h          # 电池 BMS 报文解析（纯 C++，可本机测）
 ```
 
-> **固件为什么压缩后再 base64**：小程序主包上限 2MB，而固件加了 BLE 之后是 1.58MB，
-> 直接 base64 是 2.1MB 超限。构建时用 `tools/lz_pack.py` 压到 ~1.05MB（68%），
+> **固件为什么压缩后再 base64**：小程序主包上限 2MB，而固件加了 BLE 之后是 1.59MB，
+> 直接 base64 是 2.1MB 超限。构建时用 `tools/lz_pack.py` 压到 ~1.08MB（68%），
 > 小程序里用 `utils/lz.js` 解回原始固件再上传。
+> ⚠️ 现在整包 zip 是 2,096,904 字节，离 2MB 上限只剩 248 字节 —— 固件再大一点就上传不了了。
 
 ## 编译与烧录
 

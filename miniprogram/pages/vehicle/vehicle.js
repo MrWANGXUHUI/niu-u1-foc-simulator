@@ -1,9 +1,17 @@
 const ble = require('../../utils/ble')
+const bleLink = require('../../utils/bleLink')
 
 Page({
   data: {
+    // 连接
     statusText: '未连接',
     deviceName: '',
+    fwVersion: '',
+    busy: false,
+    connected: false,
+    connectError: '',
+
+    // 车速
     speed: '0.0',
     rpm: '0',
     voltage: '0.0',
@@ -11,17 +19,17 @@ Page({
     protocolSpeed: '0',
     errorCode: '',
     unlockedText: '已锁定',
-    // 诊断
+
+    // 诊断 (折叠)
+    showDiag: false,
     qCount: 0,
     aCount: 0,
     pulseCount: 0,
     badCs: 0,
     intervalMs: 0,
     pollHz: '-',
-    connected: false,
-    busy: false,
-    frames: [],
-    // 电池 (BMS 报文解析出来的)
+
+    // 电池
     bmsHasData: false,
     soc: 0,
     socWidth: '0%',
@@ -33,37 +41,61 @@ Page({
     cells: [],
     cellBars: [],
     bmsModel: '',
+
+    // 485 原始帧 (折叠)
+    showFrames: false,
+    frames: [],
   },
 
   onLoad() {
     this.battery = ble.createBatteryState()
-    // 通知回调 —— 这个 API 老微信上也有 (2.9.0), 但还是先检查再注册
-    if (typeof wx.onBLECharacteristicValueChange === 'function') {
-      wx.onBLECharacteristicValueChange((res) => {
-        if (!res || !res.value) return
-        const uuid = (res.characteristicId || '').toLowerCase()
-        if (uuid === ble.TELEMETRY_UUID.toLowerCase()) {
-          this.onTelemetry(res.value)
-        } else if (uuid === ble.FRAME_UUID.toLowerCase()) {
-          this.onFrame(res.value)
-        } else if (uuid === ble.BATTERY_UUID.toLowerCase()) {
-          this.onBattery(res.value)
-        }
+
+    // 连接状态: 订阅全局管理器, 两个页面共享同一条连接
+    this.unsubState = bleLink.onState((s) => {
+      this.setData({
+        statusText: s.status === 'connected' ? '已连接'
+          : s.status === 'connecting' ? '连接中…'
+          : s.status === 'error' ? '连接失败' : '未连接',
+        deviceName: s.deviceName,
+        fwVersion: s.fwVersion || '',
+        connected: s.status === 'connected',
+        busy: s.status === 'connecting',
+        connectError: s.error || '',
       })
-    } else {
-      wx.showModal({
-        title: '微信版本太老',
-        content: '当前微信缺少蓝牙 API (onBLECharacteristicValueChange).\n' +
-          '到应用商店把微信更新到最新版再试。',
-        showCancel: false,
-      })
-    }
+    })
+
+    // 遥测数据
+    this.unsubData = bleLink.onData((kind, value) => {
+      if (kind === 'telemetry') this.onTelemetry(value)
+      else if (kind === 'frame') this.onFrame(value)
+      else if (kind === 'battery') this.onBattery(value)
+    })
   },
 
   onUnload() {
-    this.disconnect()
+    if (this.unsubState) this.unsubState()
+    if (this.unsubData) this.unsubData()
   },
 
+  // ---------- 连接 ----------
+  async onConnect() {
+    if (this.data.busy || this.data.connected) return
+    this.setData({ busy: true, connectError: '' })
+    try {
+      await bleLink.connect()
+    } catch (e) {
+      // 错误信息 bleLink 里已经存好了, 状态订阅会带出来
+      console.warn('连接失败', e.message)
+    } finally {
+      this.setData({ busy: false })
+    }
+  },
+
+  onDisconnect() {
+    bleLink.disconnect()
+  },
+
+  // ---------- 数据 ----------
   onTelemetry(buffer) {
     if (!buffer || buffer.byteLength < 12) return
     const t = ble.parseTelemetry(buffer)
@@ -153,63 +185,12 @@ Page({
     })
   },
 
-  async connect() {
-    if (this.data.busy) return
-    this.setData({ busy: true, statusText: '正在搜索设备…', frames: [] })
-    try {
-      // 先看基础库够不够 —— 缺 API 的话后面每个调用都会抛 "is not a function",
-      // 直接在这里说清楚, 比让人看一串天书报错强
-      const missing = ble.missingApis()
-      if (missing.length) {
-        throw new Error('当前微信 (基础库 ' + ble.libVersion() + ') 缺少这些蓝牙接口:\n' +
-          missing.join('\n') + '\n\n把微信更新到最新版再试。')
-      }
-
-      await ble.openAdapter()
-      const devices = await ble.discover(10000)
-      const dev = devices[0]
-      this.setData({ deviceName: dev.name, statusText: '正在连接 ' + dev.name + ' …' })
-      await ble.connect(dev.deviceId)
-      this.deviceId = dev.deviceId
-
-      await ble.subscribe(dev.deviceId, ble.TELEMETRY_UUID)
-      await ble.subscribe(dev.deviceId, ble.FRAME_UUID)
-      try {
-        await ble.subscribe(dev.deviceId, ble.BATTERY_UUID)
-      } catch (e) {
-        // 老固件没有电池特征, 不影响看车速
-        console.warn('没有电池特征', e)
-      }
-
-      this.setData({ connected: true, busy: false, statusText: '已连接' })
-      this.prevQ = undefined
-      this.prevQt = 0
-      wx.showToast({ title: '已连接', icon: 'none' })
-    } catch (e) {
-      this.setData({ busy: false, connected: false, statusText: '未连接' })
-      // iOS 上"扫不到"有好几种原因, 光一句报错没法区分. 把微信缓存里的设备也带上:
-      // 设备在缓存里却连不上 = iOS 的 GATT 缓存卡住了 (要重启手机/删小程序重进)
-      const known = await ble.getKnownDevices()
-      const knownText = known.length
-        ? ('\n\n微信缓存里的设备: ' + known.map((d) => (d.name || '(无名字)')).join(', '))
-        : ''
-      wx.showModal({
-        title: '连不上',
-        content: e.message + knownText,
-        showCancel: false,
-      })
-    }
+  // ---------- 折叠 ----------
+  toggleDiag() {
+    this.setData({ showDiag: !this.data.showDiag })
   },
 
-  disconnect() {
-    if (this.deviceId) {
-      wx.closeBLEConnection({ deviceId: this.deviceId, fail: () => {} })
-      this.deviceId = null
-    }
-    this.setData({ connected: false, statusText: '未连接' })
-  },
-
-  onDisconnect() {
-    this.disconnect()
+  toggleFrames() {
+    this.setData({ showFrames: !this.data.showFrames })
   },
 })

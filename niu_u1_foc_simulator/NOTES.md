@@ -288,7 +288,7 @@ BLE 广播固定用 37/38/39 三个信道 (2402/2426/2428MHz), 而 WiFi 默认�
 
 | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|
-| GET | `/ota/info` | - | `{ok, version, slot, state, progress, total, freeHeap, flashUsed, md5, uptime, apOn}` |
+| GET | `/ota/info` | - | `{ok, version, slot, state, progress, total, freeHeap, slotSize, md5, uptime, apOn}` |
 | POST | `/ota/begin` | JSON `{size, md5?}` | `{ok}` |
 | POST | `/ota/chunk` | body = base64 文本, 头 `X-Offset` = 原始字节偏移 | `{ok, written, total}` |
 | POST | `/ota/end` | - | `{ok, restart}` — 校验 + 切槽 + 重启 |
@@ -303,6 +303,44 @@ BLE 广播固定用 37/38/39 三个信道 (2402/2426/2428MHz), 而 WiFi 默认�
 3. **size 必须传准**. 擦除是随写随擦的 (4KB 一扇区, `Updater.cpp` 的 `_writeBuffer`),
    `Update.begin()` 本身不擦 —— 所以传准 size 就不会白擦 1.5MB 分区.
 
+### ⚠️ 坑: printf 的参数跟格式串错位 → 板子直接重启 (2026-11-02)
+
+**症状: `GET /ota/info` 一发, 板子立刻 Guru Meditation 重启.** OTA 第一步就断, 流程根本走不下去.
+
+```
+Guru Meditation Error: Core 0 panic'ed (Load access fault). Exception was unhandled.
+MCAUSE : 0x00000005   MTVAL : 0x00000001
+```
+
+`MTVAL = 0x1` 是关键: **有个 `%s` 吃到了一个整数 `1`, 把它当指针去解引用**.
+
+根因: `/ota/info` 的 JSON 是 `snprintf` 拼的, 格式串末尾加了 `"apOn":%d`,
+但新参数 `(int)apOn_` 被**插在了参数列表的中间** (第 5 个), 而不是最后.
+于是参数整体错位一格:
+
+| 位置 | 格式串要的 | 实际传进去的 |
+|---|---|---|
+| 5 | `%s` (state) | `(int)apOn_` = **1** ← 当成 char* 去读地址 0x1 |
+| 6 | `%u` (progress) | `stateName()` (char*) |
+| … | … | 全部往后错一格 |
+
+**编译器不会报错** —— `snprintf` 是变参函数, 类型对不上只能运行时炸.
+所以这种 bug 只能靠"参数顺序跟格式串一一对应"来防:
+现在 `infoJson()` 里每个参数后面都写了注释标明它对应哪个占位符.
+
+> 🔍 **查这个 bug 时走过的弯路, 记一下免得下次再踩**:
+> panic 的栈底有一堆 `mbedtls_sha256` / `esp_sha_dma` / `gdma_connect` 的帧,
+> 看着像"WiFi 加密硬件跟 SHA 抢 GDMA 通道". 其实是**假线索** ——
+> FreeRTOS 会复用任务栈, 那几帧是 WiFi 任务之前留下的旧数据, 跟这次崩溃无关.
+> 判断依据: 去掉 `ESP.getSketchSize()` (它内部确实会 `esp_image_verify()` 算 SHA)
+> 之后, **崩溃地址一点没变** (`MEPC` 还是 `0x40058e94`).
+>
+> 真正的二分办法: 加几个只拼一部分参数的临时路由, 逐个测.
+> 结果每个参数单独拼都不崩, 全部拼一起才崩 —— 才反应过来是错位.
+
+顺带把 `ESP.getSketchSize()` 换成了直接查分区表 (`running->size`):
+那个函数每次调用都要把 1.5MB 的镜像 SHA256 重算一遍, 慢而且跟 WiFi 加密抢硬件通道.
+
 ### 失败保护
 
 - 校验不过 / 新固件起不来 → bootloader 回到另一个槽, 老固件照跑 (`Update.end()` 内部 abort)
@@ -315,8 +353,9 @@ OTA 期间 OLED 切到 OTA 画面 (SSID + IP + 进度条), 完成后恢复速度
 ### 小程序端
 
 - 源码在仓库根的 `miniprogram/`, 固件由 `tools/build_ota.sh` 打进包里
-- **端到端验证 (不用手机)**: `bash tools/ota_push_test.sh` —— 用 curl + base64 模拟小程序全流程,
-  传完再 GET `/ota/info` 对版本号
+- **端到端验证 (不用手机)**: `bash tools/ota_push_test.sh` —— 用 curl + base64 模拟小程序全流程
+  (2026-11-02 台架跑通: 1.59MB 全传完, `/ota/end` 返回 `{"ok":true,"restart":true}`,
+  板子重启后运行分区从 `app0` 变成 `app1`)
 - 上传体验版 / 生成预览二维码: `bash tools/upload_miniprogram.sh preview` / `upload`
   (miniprogram-ci 命令行, 不需要开发者工具; 要 AppID + 上传私钥 + 公网 IP 白名单)
 
@@ -324,10 +363,52 @@ OTA 期间 OLED 切到 OTA 画面 (SSID + IP + 进度条), 完成后恢复速度
 `.bin` 和 `.txt` **不在白名单里** —— 直接把 `firmware.bin` 放进包里会在上传时被悄悄丢掉,
 小程序里读不到. 所以 `build_ota.sh` 把固件转成 base64 塞进 `miniprogram/firmware/firmware.js`.
 
-⚠️ **主包上限 2MB, 所以还得压缩**. 固件 1.58MB → base64 是 2.1MB, 超限.
-`tools/lz_pack.py` 是一个极简 LZ77 (68%), 压完 1.05MB → base64 1.4MB, 装得下.
+⚠️ **主包上限 2MB, 所以还得压缩**. 固件 1.59MB → base64 是 2.1MB, 超限.
+`tools/lz_pack.py` 是一个极简 LZ77 (68%), 压完 1.08MB → base64 1.44MB, 装得下.
 解码在小程序里做 (`miniprogram/utils/lz.js`), 格式见那个文件的头注释.
 **改了这个格式, `lz_pack.py` 和 `lz.js` 必须同步改.**
+
+> ⚠️ **现在整包 zip 是 2,096,904 字节, 离 2MB 上限 (2,097,152) 只剩 248 字节.**
+> 固件再大一点点就上传不了了. 以后加功能前先看下这个数.
+
+### 台架验证 OTA 用的脚本
+
+| 脚本 | 作用 |
+|---|---|
+| `tools/ota_open_ap.sh` | 蓝牙发 `'W'` 开热点 + 电脑连上去 (OTA 前置) |
+| `tools/ota_push_test.sh` | curl 模拟小程序全流程, 传完对比运行分区 |
+| `tools/ota_probe.sh` | 只发一个 HTTP 请求 + 看板子会不会被这一个请求搞挂 |
+
+**用 `hcitool`/`gatttool` 前要先停 bluetoothd** (它占着适配器, gatttool 会报
+`No route to host`); 扫广播还要 root, 所以用 `sudo hcitool lescan --duplicates`.
+测完记得把 bluetoothd 起回来 (`systemctl unmask bluetooth && systemctl start bluetooth`).
+
+## 6.8 小程序界面重构 (2026-11-02)
+
+原来是一个页面里塞了遥测 + OTA 两件事, 逻辑很绕. 现在拆成两个 tab:
+
+| tab | 页面 | 干什么 |
+|---|---|---|
+| 车辆 (默认) | `pages/vehicle/vehicle` | 连蓝牙 → 大字车速 → 电压/电流/转速/错误码 → 电池 → 折叠的诊断和 485 原始帧 |
+| 升级 | `pages/upgrade/upgrade` | 三步引导: ①蓝牙开热点 → ②手机连热点 → ③传固件 |
+
+**关键设计: 蓝牙连接提到全局单例** (`miniprogram/utils/bleLink.js`).
+两个页面都要蓝牙, 如果连接只存在页面里, 两个页面各连一次、互相踢掉, 用户一脸懵.
+现在 `bleLink` 管连接, 页面只订阅状态 (`onState`) 和数据 (`onData`).
+
+顺带修掉的老 bug: 通知回调原来在页面 `onLoad` 里注册但 `onUnload` 没注销 ——
+页面来回进出就会重复注册, 同一批数据被处理多次. 现在统一在 `bleLink` 里注册一次, 按 UUID 分发.
+
+**升级页为什么是三步而不是一个按钮**: OTA 需要"手机连热点"这个用户必须手动做的动作,
+而"设备开热点"是设备自己的动作. 混在一起用户不知道该干嘛. 拆成三步, 每步都有明确的完成标志.
+
+**第 ① 步的完成标志是"蓝牙命令写成功", 不是 HTTP 探测** ——
+手机这时还没连热点, 没有 192.168.4.x 网段, HTTP 必然不通, 分不清是"热点没开"还是"手机没连热点".
+命令写成功 = 固件收到并执行了 = 热点会开.
+
+**升级完成后**: 设备重启 → 热点自动关 (默认关) → HTTP 探测不再通.
+所以成功标志是 `ota.end()` 返回那一刻, **不是**之后的探测. 页面这时把 `info` 清掉,
+并提示"去车辆页确认版本" —— 蓝牙不受影响, 那边能问到新版本号.
 
 ## 6.5 BLE 遥测 (手机不连 WiFi 也能看车速)
 
@@ -500,14 +581,21 @@ V35 用功能码 `0x02` 加两个字节问 BMS, BMS 用 `0x82` 回. 反混淆 (�
 
 新增特征 `6e400005-b5a3-f393-e0a9-e50e24dcca9e` (write + read + notify):
 
-| 字节 | 含义 |
-|---|---|
-| `0x57` (`'W'`) | 开 OTA 热点 |
-| `0x58` (`'X'`) | 关 OTA 热点 |
+| 字节 | 含义 | 回包 |
+|---|---|---|
+| `0x57` (`'W'`) | 开 OTA 热点 | `[0x57, 0x01]` |
+| `0x58` (`'X'`) | 关 OTA 热点 | `[0x58, 0x01]` |
+| `0x56` (`'V'`) | 问固件版本号 | `['V', "1.4.2"]` (v1.4.2 加) |
 
 小程序侧 (`miniprogram/utils/ble.js`): `writeCommand(deviceId, cmdChar, 'W')`.
 固件侧 (`ble_telemetry.h`): `BleCmdCb::onWrite` 收到后**只排队**, 由主循环 `handle()` 执行 ——
 BLE 回调跑在蓝牙任务里, 在那边动 WiFi 会跟共存调度打架.
+
+`'V'` 是给「车辆」页显示固件版本用的: 平时 WiFi 是关的, 问不到 `/ota/info`,
+只有蓝牙这条路能问. 版本号由 `.ino` 注入 (`bleVersionProvider` → `OTA_FW_VERSION`).
+
+> ⚠️ **命令字节只认这三个**. 派发逻辑是"不是 `'V'` 就当开关热点" ——
+> 所以收到别的字节会当成 `'X'`, **把热点关掉**. 以后加新命令记得同步改派发分支.
 
 ### 三个必须知道的坑
 
@@ -574,11 +662,13 @@ Flags(3) + 名字(12) + UUID(18) = 33 **超了**, `addData` 会静默丢弃 —�
 
 - BLE 写 `0x57` → 热点起来 (信道 11 / 192.168.4.1:8080) ✅
 - BLE 写 `0x58` → 热点关 ✅
+- BLE 写 `0x56` (`'V'`) → 回 `V1.4.2` ✅ (gatttool 读特征值核对过)
 - 开→关→开→关 连做 4 次, 无 panic 无复位 ✅
 - 广播包内容用 btmon 核对过: 主广播包带完整名字 ✅
+- **HTTP 端到端也通了** (2026-11-02): `tools/ota_push_test.sh` 全流程跑完,
+  运行分区从 `app0` 变成 `app1` ✅ (见 §6)
 
-**没验证的**: HTTP 端到端 (这台开发机的无线网卡扫不到 2.4GHz, 连不上 ESP32 热点),
-需要用户在车上用小程序实测. (BLE 那条路已通, 见 §7.3.)
+**还没验证的**: 真机上的小程序 UI (iPhone 上扫码点按钮), 得用户实测.
 
 ## 7. 已知问题 / 坑
 
@@ -598,7 +688,8 @@ Flags(3) + 名字(12) + UUID(18) = 33 **超了**, `addData` 会静默丢弃 —�
 | BLE 防丢器自动解锁 | ❌ 已放弃 | 红米 Watch 3 广播窗口太短 + iPhone 侧无法配合, 实现不了, 已移除 |
 | NFC (PN532) 无钥匙解锁 | ❌ 已移除 | 2026-10-22 删除驱动代码/接线文档/库依赖, I2C 只留板载 OLED |
 | 485 FOC 解锁 CRC16 (poly 0x7085) | ❌ 未实现 | 真正的 FOC 解锁需要 CRC16 算 token, 现在只处理 0x01 unlock 命令立即返回成功 |
-| OTA 通道 | ✅ 硬件实测通过 | 固件侧用 `tools/ota_push_test.sh` 推过好几次 (含 1.58MB 的 BLE 固件), 分区切换正常; 小程序真机行为还没实测 (这台机器没有微信开发者工具也没有 iPhone) |
+| OTA 通道 | ✅ 硬件实测通过 | 固件侧用 `tools/ota_push_test.sh` 推过好几次 (含 1.59MB 的 BLE 固件), 分区切换正常; 小程序真机行为还没实测 (这台机器没有微信开发者工具也没有 iPhone) |
+| **`/ota/info` 一发就重启** | ✅ 2026-11-02 修 | `snprintf` 的参数跟格式串错位一格, `%s` 吃到了整数 `1` 当指针解引用 → Load access fault. 见 §6 的专项 |
 | 485 分帧靠 0x16 找帧尾 | ✅ 修 | 数据区里也可能有 0x16 (明文 0xE3 + 0x33), 会把帧劈成两半 → 改成按长度字节定帧 (见 §6.6) |
 | 电池 BMS 报文 | 🔄 待上车实测 | 解析器用真车抓包的 2041 帧 BMS 报文逐字段核对过 (100% 解析成功, 校验和 0 错); BLE 打包格式也跟小程序端对过; 但**装到车上抓真实 BMS 报文还没测** (板子当时没接在车上的 485 总线上) |
 | BLE 断连后不广播 | ✅ 修 | 在 `onDisconnect` 回调里重启广播会被静默丢掉, 必须延后到主循环 (见 §6.5) |
@@ -857,8 +948,9 @@ HTTP 端到端 (本机无线网卡扫不到 2.4GHz, 连不上 ESP32 热点) —�
 | `../tools/build_ota.sh` | 编译固件 + 压缩 + 打成小程序的 `firmware.js` |
 | `../tools/lz_pack.py` | 固件压缩 (极简 LZ77, 配套 `miniprogram/utils/lz.js`) |
 | `../tools/ota_push_test.sh` | curl 模拟小程序的端到端 OTA 测试 |
+| `../tools/ota_open_ap.sh` | 蓝牙开热点 + 电脑连上去 (OTA 测试前置) |
 | `../tools/upload_miniprogram.sh` | miniprogram-ci 上传 / 生成预览二维码 |
-| `../miniprogram/` | 微信小程序源码 |
+| `../miniprogram/` | 微信小程序源码 (`utils/bleLink.js` 是全局蓝牙连接单例) |
 
 ## 10. 引用资料
 

@@ -37,6 +37,27 @@ page {
   color: #9fd0ff;
 }
 
+.tip {
+  margin-top: 20rpx;
+  color: #8e8e96;
+  font-size: 24rpx;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+/* 折叠标题 (两个页面都在用) */
+.fold-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 8rpx;
+}
+
+.fold-arrow {
+  font-size: 24rpx;
+  color: #6e7681;
+}
+
 button.primary {
   background: #1a7f37;
   color: #fff;

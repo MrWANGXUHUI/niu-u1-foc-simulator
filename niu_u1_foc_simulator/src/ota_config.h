@@ -18,9 +18,9 @@
 // 小程序每次 POST 的原始固件字节数上限 (base64 后约 x1.34)
 #define OTA_CHUNK_SIZE   4096
 
-// 固件版本号, 只通过 /ota/info 和 OLED 暴露.
+// 固件版本号, 通过 /ota/info、OLED 和蓝牙命令 'V' 三处暴露.
 // 不改 485 协议的 0x01 04 应答 (仍回 0x11), 免得破坏已经跑通的 V35 交互.
-#define OTA_FW_VERSION   "1.4.1"
+#define OTA_FW_VERSION   "1.4.2"
 
 // 单个 app 槽的大小上限 —— 必须跟 partitions.csv 里的 app0/app1 一致.
 // 超过就 Update.begin() 直接报 UPDATE_ERROR_SIZE.

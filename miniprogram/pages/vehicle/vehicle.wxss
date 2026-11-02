@@ -1,0 +1,163 @@
+/* 未连接时的引导 */
+.big-status {
+  font-size: 34rpx;
+  color: #e8e8ea;
+  text-align: center;
+  padding: 20rpx 0 16rpx;
+}
+
+/* 连接失败时把原因显示出来 */
+.tip.err {
+  color: #f85149;
+  margin-top: 16rpx;
+}
+
+/* 连接条: 吸顶, 一直知道连没连上 */
+.conn-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #232329;
+  border-radius: 20rpx;
+  margin: 24rpx 24rpx 0;
+  padding: 20rpx 28rpx;
+}
+
+.conn-left {
+  display: flex;
+  align-items: center;
+}
+
+.dot {
+  width: 14rpx;
+  height: 14rpx;
+  border-radius: 50%;
+  background: #3fb950;
+  margin-right: 14rpx;
+}
+
+.conn-text {
+  font-size: 26rpx;
+  color: #e8e8ea;
+}
+
+.conn-dev {
+  font-size: 24rpx;
+  color: #8e8e96;
+  margin-left: 14rpx;
+}
+
+/* 固件版本: 连上后从蓝牙问来的 */
+.conn-ver {
+  font-size: 22rpx;
+  color: #58a6ff;
+  margin-left: 10rpx;
+}
+
+.link-btn {
+  font-size: 26rpx;
+  color: #8e8e96;
+  padding: 8rpx 4rpx 8rpx 20rpx;
+}
+
+/* 车速 */
+.speed-wrap {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  padding: 16rpx 0 28rpx;
+}
+
+.speed {
+  font-size: 132rpx;
+  font-weight: 600;
+  color: #7ee787;
+  line-height: 1;
+}
+
+.unit {
+  font-size: 32rpx;
+  color: #8e8e96;
+  margin-left: 12rpx;
+}
+
+/* 车速下面一排小指标 */
+.stat-row {
+  display: flex;
+  border-top: 1rpx solid #21262d;
+  padding-top: 20rpx;
+}
+
+.stat {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.stat-label {
+  font-size: 22rpx;
+  color: #8e8e96;
+}
+
+.stat-value {
+  font-size: 34rpx;
+  color: #e8e8ea;
+  margin-top: 6rpx;
+}
+
+.stat-unit {
+  font-size: 20rpx;
+  color: #6e7681;
+  margin-top: 2rpx;
+}
+
+/* 折叠标题 */
+.fold-hint {
+  font-size: 26rpx;
+  color: #58a6ff;
+}
+
+/* 电池 */
+.soc-bar {
+  height: 14rpx;
+  background: #21262d;
+  border-radius: 7rpx;
+  overflow: hidden;
+  margin: 8rpx 0 20rpx;
+}
+
+.soc-fill {
+  height: 100%;
+  background: #58a6ff;
+}
+
+.cell-bars {
+  display: flex;
+  align-items: flex-end;
+  margin-top: 20rpx;
+  padding-top: 12rpx;
+  border-top: 1rpx solid #21262d;
+}
+
+.cell-bar {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.cell-fill {
+  width: 60%;
+  min-height: 20rpx;
+  background: #3fb950;
+  border-radius: 4rpx 4rpx 0 0;
+}
+
+.cell-text {
+  font-size: 16rpx;
+  color: #6e7681;
+  margin-top: 6rpx;
+  transform: scale(0.85);
+}

@@ -230,17 +230,34 @@ private:
     // ---------- 路由处理 ----------
     String infoJson() {
         const esp_partition_t* running = esp_ota_get_running_partition();
+        // 不用 ESP.getSketchSize(): 它内部会 esp_image_verify(), 把 1.5MB 的
+        // app 镜像 SHA256 重算一遍 (走硬件 SHA, 而 C3 的加密 GDMA 通道跟 WiFi
+        // 驱动共用). 一次 info 请求几十毫秒, 还可能跟热点上的加密抢通道.
+        // 分区大小直接查分区表就够.
+        uint32_t slotSize = running ? running->size : 0;
         char buf[512];
+        // ⚠️ 参数顺序必须跟格式串里的占位符**一一对应**, 一个都不能错位 ——
+        // 错位了编译器不会报错, 但运行时会拿 int 当 char* 去解引用:
+        //   %s 吃到一个整数 1 → 读地址 0x1 → Load access fault → 板子重启
+        // (2026-11-02 就是这么查了半天: /ota/info 一发就重启, 栈底那个
+        //  "sha256/GDMA" 是 FreeRTOS 复用任务栈留下的旧数据, 跟真正的错位无关)
         snprintf(buf, sizeof(buf),
                  "{\"ok\":true,\"version\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"port\":%d,"
-                 "\"state\":\"%s\",\"progress\":%u,\"total\":%u,\"freeHeap\":%u,\"flashUsed\":%u,"
+                 "\"state\":\"%s\",\"progress\":%u,\"total\":%u,\"freeHeap\":%u,\"slotSize\":%u,"
                  "\"slot\":\"%s\",\"md5\":\"%s\",\"uptime\":%lu,\"apOn\":%d}",
-                 OTA_FW_VERSION, OTA_AP_SSID, WiFi.softAPIP().toString().c_str(), OTA_HTTP_PORT,
-                 (int)apOn_,
-                 stateName(), written_, totalSize_,
-                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getSketchSize(),
-                 running ? running->label : "?", md5_,
-                 (unsigned long)(millis() / 1000));
+                 OTA_FW_VERSION,                        // %s  version
+                 OTA_AP_SSID,                           // %s  ssid
+                 WiFi.softAPIP().toString().c_str(),    // %s  ip
+                 OTA_HTTP_PORT,                         // %d  port
+                 stateName(),                           // %s  state
+                 (unsigned)written_,                    // %u  progress
+                 (unsigned)totalSize_,                  // %u  total
+                 (unsigned)ESP.getFreeHeap(),           // %u  freeHeap
+                 (unsigned)slotSize,                    // %u  slotSize
+                 running ? running->label : "?",        // %s  slot
+                 md5_,                                  // %s  md5
+                 (unsigned long)(millis() / 1000),      // %lu uptime
+                 (int)apOn_);                           // %d  apOn
         return String(buf);
     }
 
