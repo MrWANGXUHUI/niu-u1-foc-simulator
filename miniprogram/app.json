@@ -1,5 +1,10 @@
 {
-  "pages": ["pages/vehicle/vehicle", "pages/upgrade/upgrade"],
+  "pages": [
+    "pages/vehicle/vehicle",
+    "pages/upgrade/upgrade",
+    "pages/telemetry/telemetry",
+    "pages/index/index"
+  ],
   "window": {
     "backgroundTextStyle": "dark",
     "navigationBarBackgroundColor": "#16161a",

@@ -1,0 +1,4 @@
+<!-- 跳板页, 打开就跳到「车辆」tab, 这里只是个占位 -->
+<view class="card">
+  <view class="tip">正在打开车辆页面…</view>
+</view>
