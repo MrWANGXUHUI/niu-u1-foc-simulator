@@ -410,6 +410,40 @@ OTA 期间 OLED 切到 OTA 画面 (SSID + IP + 进度条), 完成后恢复速度
 所以成功标志是 `ota.end()` 返回那一刻, **不是**之后的探测. 页面这时把 `info` 清掉,
 并提示"去车辆页确认版本" —— 蓝牙不受影响, 那边能问到新版本号.
 
+### ⚠️ 改页面路径前一定要留跳板页 (2026-11-02 踩的坑)
+
+把 `pages/telemetry` 改名成 `pages/vehicle` 之后, 小程序**默认打开时报**
+"该页面不存在, 你可以进入小牛esp32助手首页获取更多服务" ——
+但**点左上角「首页」完全正常**.
+
+原因: 小程序可以带着一个**页面路径**被打开, 而这个路径可能记在好几处:
+
+- 公众平台「设置 → 基本设置 → 小程序主页」里设的路径
+- 以前生成的老小程序码/二维码
+- 微信里的历史分享链接、收藏的旧入口
+
+这些都指着**改名前**的 `pages/telemetry/telemetry`. 那个路径一旦不存在,
+微信就报"页面不存在", 用户连小程序都进不去.
+而点左上角「首页」走的是 `pages[0]` (`pages/vehicle/vehicle`), 所以是好的 ——
+**这个差别就是判断依据: 首页能进、默认进不去 = 默认路径是陈旧的.**
+
+**修法: 旧路径留着同名空页, 进来就跳到新页面.**
+`pages/telemetry/telemetry` 和 `pages/index/index` 现在都只是跳板:
+
+```js
+Page({
+  onLoad() {
+    wx.switchTab({ url: '/pages/vehicle/vehicle' })   // tabBar 页面只能用 switchTab
+  }
+})
+```
+
+注意 **tabBar 页面只能用 `wx.switchTab` 跳**, `redirectTo`/`navigateTo` 跳不过去.
+
+> 顺带: 排查这个的时候, 上传日志里只列 `.js/.wxml/.wxss`, **看不到编译器重新生成的 app.json**
+> (它是由 `app.json` + 页面 json 重新拼出来的). 用 `tools/dump_appjson.js` 本地跑一遍编译,
+> 直接把生成的 app.json 和文件清单打出来, 比猜快得多.
+
 ## 6.5 BLE 遥测 (手机不连 WiFi 也能看车速)
 
 OTA 走 WiFi 热点 —— 手机一连热点就断网, 推完固件还得手动切回自己的 WiFi.
