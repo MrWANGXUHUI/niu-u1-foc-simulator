@@ -37,12 +37,17 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdbool.h>   // 这个头文件不依赖 Arduino, 要能单独在 PC 上编译
 
 #define BMS_ADDR            0x31
 #define BMS_STATUS_LEN      15
 #define BMS_CELLS_LEN       40
 #define BMS_MODEL_LEN       36
 #define BMS_INFO_LEN        43
+// 数据区的缓冲区上限. 必须 >= 上面所有已知帧长, 且要比 BMS_INFO_LEN 留余量 ——
+// 现在这个坑就是: 缓冲区刚好开成 43 (照着目前观测到的最大帧), 一个字节余量都没有,
+// BMS 只要回一帧数据区更长的应答就写穿栈, 板子直接 PANIC 重启.
+#define BMS_MAX_DATA_LEN    64
 #define BMS_MAX_CELLS       20
 #define BMS_TEMP_COUNT      5
 #define BMS_MODEL_CHARS     16
@@ -97,8 +102,9 @@ static inline bool bmsParseFrame(const uint8_t* raw, size_t len, BmsInfo* out) {
 
     uint8_t dataLen = raw[5];
     if ((size_t)dataLen + 8 != len) return false;   // 长度字段和实际帧长对不上
+    if (dataLen > BMS_MAX_DATA_LEN) return false;   // 数据区比缓冲区还长 → 丢弃, 绝不能拷贝
 
-    uint8_t plain[BMS_INFO_LEN];
+    uint8_t plain[BMS_MAX_DATA_LEN];
     for (uint8_t i = 0; i < dataLen; i++) {
         plain[i] = (uint8_t)(raw[6 + i] - 0x33);
     }
