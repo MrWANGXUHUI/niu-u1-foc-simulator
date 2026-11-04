@@ -314,7 +314,10 @@ function parseTelemetry(buffer) {
     protocolSpeed: v.getUint8(8),
     error: v.getUint8(9),
     unlocked: v.getUint8(10),
-    flags: v.getUint8(11),
+    // 字节 11: 原来是 flags (bit0 = 刚收到过 485 帧, 但设了从没读过),
+    // 现在拿来传"被判为毛刺丢掉的快脉冲数" —— 车速不对时用它分辨
+    // "脉冲真的多"还是"传感器振铃"
+    glitchCount: v.getUint8(11),
     // 诊断字段 —— 骑车时用它们分清"霍尔没脉冲"还是"485 没应答"
     qCount: 0,        // 收到的 V35 状态查询次数
     aCount: 0,        // 我们回出的应答次数

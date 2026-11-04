@@ -27,6 +27,7 @@ Page({
     pulseCount: 0,
     badCs: 0,
     intervalMs: 0,
+    glitchCount: 0,
     pollHz: '-',
 
     // 电池
@@ -124,6 +125,7 @@ Page({
       pulseCount: t.pulseCount,
       badCs: t.badCs,
       intervalMs: t.intervalMs,
+      glitchCount: t.glitchCount,
       pollHz: pollHz,
     })
   },

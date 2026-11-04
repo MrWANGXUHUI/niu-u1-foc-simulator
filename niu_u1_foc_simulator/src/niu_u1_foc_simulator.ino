@@ -48,6 +48,14 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_MIRROR, /* reset=*/ U8X8_PIN_NONE)
 
 // 霍尔测速参数
 #define HALL_DEBOUNCE_US      1000      // ISR 消抖: 1ms, 远小于最慢的真实脉冲间隔
+// 物理上不可能的最小脉冲间隔 —— 毛刺闸门.
+// 1 磁钢 + 1.28m 轮子: 30km/h 时真实间隔 154ms, 60km/h 时 77ms.
+// 25ms 对应 ~92km/h, 也就是说真实脉冲永远不可能落在这个区间里 ——
+// 落在里面的只能是传感器振铃 / 线受干扰产生的毛刺.
+// 为什么需要它: 车上 485 和电机控制器是强干扰源, 传感器开漏输出用内部 45k 上拉
+// 走长线, 边沿的振铃能通过 1ms 消抖. 一个毛刺会把一个真间隔劈成"几毫秒 + 剩下的"
+// 两半, 毛刺占多数时 5 个样本的中位数就变成毛刺值 → 转速离谱 (实测 40 倍).
+#define HALL_MIN_INTERVAL_US  25000
 #define HALL_STOP_TIMEOUT_US  3000000   // 3s 没有新脉冲 → 认为停转, 车速归 0
 // 停转阈值定 3s 是为了顾到低速骑行: 3s 转一圈 = 1.28m/3s = 1.5 km/h,
 // 也就是低于 1.5km/h 仪表本来就看不出差别, 归零没有损失; 而 2s 的话
@@ -166,6 +174,7 @@ static uint8_t hall_hist_cnt = 0;
 static uint8_t hall_hist_idx = 0;
 static uint32_t hall_used_pulse_us = 0;   // 已经算过间隔的那个脉冲时刻
 static uint32_t hall_gap_reset = 0;       // 因停车太久重置过历史的次数 (诊断用)
+volatile uint32_t hall_glitch_count = 0;  // 被判为毛刺丢掉的快脉冲次数 (诊断用)
 
 // 协议速度值 — 线性刻度, 1 格 = 12/25 = 0.48 km/h
 // 依据:
@@ -183,6 +192,7 @@ uint16_t calcFOCSpeedFromKMH(float kmh) {
 // 轮速更新由 loop 周期驱动 (不是只在收到查询时), OLED 才能显示实时速度
 static unsigned long lastSpeedCalc = 0;
 static uint32_t last_interval_us = 0;   // 最近一次测到的脉冲间隔, 只用于日志
+static uint32_t hall_median_us = 0;     // 算转速实际用的那个间隔 (5 个样本的中位数), 只用于日志
 
 // 取最近若干个间隔的中位数 —— 抗漏脉冲和抗毛刺都靠它
 static uint32_t hallMedianInterval() {
@@ -243,6 +253,7 @@ void updateWheelSpeed() {
 
     if (!stopped) {
         uint32_t base = hallMedianInterval();
+        hall_median_us = base;   // 存一份给串口日志: 转速用的是它, 不是 last_interval_us
         if (base > 0) {
             float period_s = base / 1000000.0f;
             rpm = 60.0f / (period_s * MAGNET_COUNT);
@@ -264,6 +275,15 @@ void IRAM_ATTR wheelPulseISR() {
     uint32_t now = micros();
     // 1ms 消抖: 单磁钢在 30km/h 下脉冲间隔约 154ms, 1ms 阈值不会漏计真实脉冲
     if (now - last_pulse_us > HALL_DEBOUNCE_US) {
+        // 物理上不可能的快脉冲 → 判为毛刺 (振铃/干扰), 丢掉.
+        // 关键: **丢掉时不更新 last_pulse_us / prev_pulse_us**.
+        // 更新了的话, 一个毛刺会把一个真间隔劈成"几毫秒 + 剩下的"两半:
+        // 短的进中位数历史, 长的又比真实值大 —— 车速两头都错.
+        // 不更新, 下一个真脉冲算出来的间隔才是准的.
+        if (last_pulse_us != 0 && now - last_pulse_us < HALL_MIN_INTERVAL_US) {
+            hall_glitch_count++;
+            return;
+        }
         prev_pulse_us = last_pulse_us;
         last_pulse_us = now;
         wheel_pulse_count++;
@@ -907,7 +927,7 @@ void loop() {
         .protocol_speed = (uint8_t)foc_status.foc_speed,
         .error = foc_status.error,
         .unlocked = foc_status.unlocked,
-        .flags = 0,
+        .glitch_count = (hall_glitch_count > 255) ? 255 : (uint8_t)hall_glitch_count,
         .q_count = simulator.q_count,
         .a_count = simulator.a_count,
         .pulse_count = (uint16_t)wheel_pulse_count,
@@ -972,12 +992,14 @@ void loop() {
 
     if (millis() - last_debug > 3000) {
 #if USE_HALL_SPEED
-        Serial.printf("[状态] %s | 轮速:%dRPM | %.1fkm/h | 间隔:%lums | 脉冲:%lu | 停车重置:%lu\n",
+        Serial.printf("[状态] %s | 轮速:%dRPM | %.1fkm/h | 间隔:%lums(中位%lums) | 脉冲:%lu | 毛刺:%lu | 停车重置:%lu\n",
             foc_status.unlocked ? "已解锁" : "已锁定",
             foc_status.wheel_rpm,
             foc_status.wheel_speed_dm / 10.0,
             (unsigned long)last_interval_us,
+            (unsigned long)hall_median_us,
             (unsigned long)wheel_pulse_count,
+            (unsigned long)hall_glitch_count,
             (unsigned long)hall_gap_reset);
 #else
         Serial.printf("[状态] %s | 轮速:%dRPM | %.1fkm/h\n",

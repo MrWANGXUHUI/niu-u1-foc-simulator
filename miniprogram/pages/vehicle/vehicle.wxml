@@ -112,6 +112,10 @@
         <text class="label">霍尔脉冲 / 间隔</text>
         <text class="value">{{pulseCount}} / {{intervalMs}} ms</text>
       </view>
+      <view class="row" wx:if="{{glitchCount}}">
+        <text class="label">霍尔毛刺（已丢弃）</text>
+        <text class="value">{{glitchCount}}</text>
+      </view>
       <view class="row" wx:if="{{badCs}}">
         <text class="label">校验和错帧</text>
         <text class="value">{{badCs}}</text>
@@ -119,6 +123,8 @@
       <view class="tip">
         轮询数一直涨 = 总线通; 应答数跟着涨 = 我们答上了 (两个数应该相等);
         脉冲数不涨 = 霍尔/磁钢没信号, 车速自然是 0.
+        毛刺数 = 被丢掉的快脉冲 (传感器振铃/线受干扰), 一直涨说明传感器或接线有问题;
+        车速偏大但毛刺是 0 = 磁钢不止一颗, MAGNET_COUNT 要改.
       </view>
     </block>
   </view>

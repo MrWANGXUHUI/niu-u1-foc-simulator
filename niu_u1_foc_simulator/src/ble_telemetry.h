@@ -53,7 +53,11 @@ struct BleTelemetryData {
     uint8_t  protocol_speed;  // 485 协议车速值 (0-127)
     uint8_t  error;           // 错误码
     uint8_t  unlocked;        // 1 = 已解锁
-    uint8_t  flags;           // bit0: 刚收到过 485 帧
+    // 字节 11 原来放的是 flags (bit0 = 刚收到过 485 帧), 但那个位设了从来没读过,
+    // 小程序也没显示 —— 干脆拿来传毛刺计数, 诊断车速问题用.
+    // 不加新字段是为了不动 20 字节的帧长: 协商不出 MTU 时单条 notify 只能发 20 字节,
+    // 加到 24 字节在有些手机上会直接发不出去, 整条遥测就断了.
+    uint8_t  glitch_count;    // 被判为毛刺丢掉的快脉冲数 (饱和到 255)
     // ↓ 诊断字段: 骑车时用小程序一眼分清"是霍尔没脉冲"还是"485 没应答"
     uint16_t q_count;         // 收到 V35 状态查询的次数
     uint16_t a_count;         // 我们回出去的应答次数 (应与 q_count 相等)
@@ -169,7 +173,6 @@ public:
         memcpy(frameBuf_, raw, len);
         frameLen_ = len;
         frameSeq_++;
-        data_.flags |= 0x01;
     }
 
     // 电池信息 —— BMS 应答解析出来的结果
@@ -273,7 +276,7 @@ public:
         buf[8]  = data_.protocol_speed;
         buf[9]  = data_.error;
         buf[10] = data_.unlocked;
-        buf[11] = data_.flags;
+        buf[11] = data_.glitch_count;
         buf[12] = data_.q_count & 0xFF;
         buf[13] = data_.q_count >> 8;
         buf[14] = data_.a_count & 0xFF;
