@@ -22,6 +22,7 @@
 #include "ble_config.h"
 #include "ble_telemetry.h"
 #include "bms_protocol.h"
+#include "bus_log.h"
 
 // ============ OLED 引脚定义 (板载I2C: SDA=GPIO5, SCL=GPIO6) ============
 #define I2C_SDA_PIN 5
@@ -152,6 +153,15 @@ BleTelemetry bleTelemetry;
 // 但把电压/电流/电量/温度/单体电压解析出来给小程序看.
 static BmsInfo bms_info = {0};
 static unsigned long bms_last_log = 0;
+
+// BMS 诊断计数 —— 回答"小程序上为什么没有电池数据".
+// 有了这几个数就能一眼分清三种情况:
+//   rxFrames == 0              → 总线上根本没有 BMS 应答 (BMS 没回话, 或我们的分帧把它吃了)
+//   rxFrames > 0, okFrames == 0 → 帧收到了但解析不出来 (校验和错 = 被干扰/被撞坏)
+//   okFrames > 0               → 固件这边完全正常, 问题在蓝牙这一段
+static BmsDiag bms_diag = {0};
+static unsigned long bms_last_rx_ms = 0;
+static bool bms_seen = false;
 
 // ============ 轮速测量 ============
 // 单磁钢 + 计数窗口测不出速度: 17km/h 时 250ms 窗口只期望 0.9 个脉冲, 读数会在
@@ -342,6 +352,10 @@ private:
         }
         frame[idx++] = calcChecksum(frame, idx);
         frame[idx++] = 0x16;
+        // 记进 485 总线日志 (手机点"保存日志"时会把这些拉走做离线分析).
+        // 带上 TX 是关键: 只有同时看到"V35 的问"和"我们回的答"跟时间戳,
+        // 才能算出应答延迟 —— 而应答延迟正是 V35 超时 (错误码 190) 的根因.
+        busLog().record(BUS_LOG_DIR_TX, millis(), frame, idx);
         setTransmitMode(true);
         serial->write(frame, idx);
         serial->flush();
@@ -491,9 +505,22 @@ public:
         // 总线上抓到的帧原样推给手机 —— 不管是发给谁的问询帧都推
         bleTelemetry.pushFrame(raw_frame, len);
 #endif
-        // 电池 BMS 的应答 —— 我们不是 BMS, 不应答, 只在旁边听并解析
+        // 电池 BMS 的应答 —— 我们不是 BMS, 不应答, 只在旁边听并解析.
+        // 注意: 地址对是 31 CE 的帧有两种 —— V35 问 BMS 的**请求** (功能码 0x02),
+        // 和 BMS 回 V35 的**应答** (功能码 0x82, 最高位是 1). 只有后者才是"BMS 回话了",
+        // 统计的时候要分清楚, 不然会把"看到 40 帧"误当成"收到 40 次应答".
         if (raw_frame[1] == BMS_ADDR) {
-            bmsParseFrame(raw_frame, len, &bms_info);
+            int st = bmsParseFrame(raw_frame, len, &bms_info);
+            if (raw_frame[4] & 0x80) {          // 是应答, 不是请求
+                bms_diag.rxFrames++;
+                bms_diag.lastLen = (uint8_t)len;
+                bms_last_rx_ms = millis();
+                bms_seen = true;
+                if (st == BMS_PARSE_OK)              bms_diag.okFrames++;
+                else if (st == BMS_PARSE_BAD_CS)     bms_diag.csErr++;
+                else if (st == BMS_PARSE_BAD_LEN)    bms_diag.lenErr++;
+                else if (st == BMS_PARSE_UNKNOWN)    bms_diag.unknownLen++;
+            }
             return;
         }
         uint8_t addr = raw_frame[1];
@@ -555,6 +582,7 @@ static void bleVersionProvider(char* out, size_t cap) {
 
 static uint8_t rx_buf[256];
 static size_t rx_len = 0;
+static unsigned long rx_first_byte_ms = 0;   // 当前帧第一字节到达的时刻 (日志用)
 static unsigned long last_debug = 0;
 #if DEBUG_INJECT_485
 static char injectBuf[512];
@@ -585,6 +613,7 @@ static void rxPush(uint8_t c) {
     if (rx_len == 0) {
         // 总线空闲时会有 fe / 55 之类的填充字节, 不是 0x68 就丢掉
         if (c != 0x68) return;
+        rx_first_byte_ms = millis();   // 帧的第一字节到达的时刻 (日志用)
 #if DEBUG_485_ECHO
         Serial.printf("[485←] ");
 #endif
@@ -614,6 +643,9 @@ static void rxPush(uint8_t c) {
 #if DEBUG_485_ECHO
         Serial.printf("\n");
 #endif
+        // 记进 485 总线日志. 时间戳用**第一字节到达**的时刻, 不是凑齐的时刻 ——
+        // 差的这几毫秒正好是"应答延迟"里最要紧的一段.
+        busLog().record(BUS_LOG_DIR_RX, rx_first_byte_ms, rx_buf, rx_len);
         simulator.parseFrame(rx_buf, rx_len);
         rx_len = 0;
     }
@@ -934,7 +966,17 @@ void loop() {
         .bad_cs = (uint8_t)simulator.bad_cs,
         .interval_x10 = (uint8_t)(last_interval_us / 10000 > 255 ? 255 : last_interval_us / 10000),
     });
-    bleTelemetry.publishBattery(bms_info);
+    // BMS 诊断计数 —— 小程序上"没电池数据"时, 用这几个数定位是哪一环断了.
+    // 5Hz 往蓝牙任务里塞就够 (通知本身也是 1Hz), 每次循环都塞只是白占互斥量.
+    static unsigned long last_bms_pub = 0;
+    if (millis() - last_bms_pub > 200) {
+        last_bms_pub = millis();
+        bleTelemetry.publishBattery(bms_info);
+        bms_diag.ageMs = bms_seen ? (millis() - bms_last_rx_ms) : 0xFFFFFFFFu;
+        bms_diag.qCount = simulator.q_count;
+        bms_diag.aCount = simulator.a_count;
+        bleTelemetry.publishDiag(bms_diag);
+    }
     bleTelemetry.handle();
 #endif
 
@@ -1012,6 +1054,12 @@ void loop() {
         Serial.printf("[485] 查询:%u 应答:%u 其它:%u 校验错:%u | 协议车速:%u\n",
             simulator.q_count, simulator.a_count, simulator.oth, simulator.bad_cs,
             foc_status.foc_speed);
+        // BMS 侧 —— "小程序没电池数据"时先看这一行:
+        //   帧数=0 → 总线上就没有 BMS 应答; 帧数>0 但成功=0 → 校验和/长度有问题 (被干扰)
+        Serial.printf("[BMS] 帧:%u 成功:%u 校验错:%u 长度错:%u 未知:%u 距上次:%lums\n",
+            bms_diag.rxFrames, bms_diag.okFrames, bms_diag.csErr, bms_diag.lenErr,
+            bms_diag.unknownLen, (long)(bms_seen ? (millis() - bms_last_rx_ms) : -1));
+        Serial.printf("[LOG] 485 日志缓冲 %u 帧\n", (unsigned)busLog().count());
 #if OTA_AP_ENABLE
         // 热点状态 —— 排查"手机连不上热点"时看这一行:
         // 客户端数一直是 0 = 手机压根没关联上 (不是 HTTP 层的问题)

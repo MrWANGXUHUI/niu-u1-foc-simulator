@@ -21,6 +21,17 @@
  *   [13..14] 最低单体 mV (小端 u16)
  *   [15..16] 最高单体 mV (小端 u16)
  *
+ * 诊断消息 (16 字节) —— "为什么没收到电池报文"的答案:
+ *   [0..1]  总线上看到的 BMS 帧数 (u16)
+ *   [2..3]  解析成功数 (u16)
+ *   [4]     校验和错
+ *   [5]     长度对不上
+ *   [6]     数据区长度没见过
+ *   [7]     上次看到的 BMS 帧的总长度
+ *   [8..11] 距上次 BMS 帧过了多少毫秒 (u32, 0xFFFFFFFF = 从来没有)
+ *   [12..13] V35 查询数 (u16)
+ *   [14..15] 我们的应答数 (u16)
+ *
  * 单体电压消息: 每格 2 字节 mV (小端 u16)
  * 型号串消息: ASCII
  *
@@ -40,6 +51,7 @@
 #define BLE_BMSG_STATUS  1
 #define BLE_BMSG_CELLS   2
 #define BLE_BMSG_MODEL   3
+#define BLE_BMSG_DIAG    4
 
 // 单条通知里除消息头外最多带多少字节数据 (20 - 3)
 #define BLE_BMSG_PAYLOAD_MAX 17
@@ -48,6 +60,8 @@
 
 // 状态消息的数据长度
 #define BLE_BMSG_STATUS_LEN 17
+// 诊断消息的数据长度
+#define BLE_BMSG_DIAG_LEN  16
 
 // 打包状态消息, 返回写入的字节数 (固定 BLE_BMSG_STATUS_LEN)
 static inline size_t bleBatteryPackStatus(const BmsInfo* info, uint8_t* out) {
@@ -92,6 +106,27 @@ static inline size_t bleBatteryPackModel(const BmsInfo* info, uint8_t* out) {
     size_t n = strlen(info->model);
     memcpy(out, info->model, n);
     return n;
+}
+
+// 打包诊断消息, 返回字节数 (固定 BLE_BMSG_DIAG_LEN)
+static inline size_t bleBatteryPackDiag(const BmsDiag* d, uint8_t* out) {
+    out[0] = (uint8_t)(d->rxFrames & 0xFF);
+    out[1] = (uint8_t)(d->rxFrames >> 8);
+    out[2] = (uint8_t)(d->okFrames & 0xFF);
+    out[3] = (uint8_t)(d->okFrames >> 8);
+    out[4] = d->csErr;
+    out[5] = d->lenErr;
+    out[6] = d->unknownLen;
+    out[7] = d->lastLen;
+    out[8] = (uint8_t)(d->ageMs & 0xFF);
+    out[9] = (uint8_t)((d->ageMs >> 8) & 0xFF);
+    out[10] = (uint8_t)((d->ageMs >> 16) & 0xFF);
+    out[11] = (uint8_t)((d->ageMs >> 24) & 0xFF);
+    out[12] = (uint8_t)(d->qCount & 0xFF);
+    out[13] = (uint8_t)(d->qCount >> 8);
+    out[14] = (uint8_t)(d->aCount & 0xFF);
+    out[15] = (uint8_t)(d->aCount >> 8);
+    return BLE_BMSG_DIAG_LEN;
 }
 
 // 把一条消息切成一片. 返回这一片的总长度 (3 + 数据), 数据为空时返回 0

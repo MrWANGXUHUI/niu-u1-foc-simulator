@@ -17,17 +17,20 @@ const TELEMETRY_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'
 const FRAME_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'
 const BATTERY_UUID = '6e400004-b5a3-f393-e0a9-e50e24dcca9e'
 const CMD_UUID = '6e400005-b5a3-f393-e0a9-e50e24dcca9e'
+const LOG_UUID = '6e400006-b5a3-f393-e0a9-e50e24dcca9e'
 const NAME_PREFIX = 'NIU-U1'
 
 // 命令字节 —— 对应固件 ble_telemetry.h 的 BleCommand
 const CMD_START_AP = 'W'   // 临时开 OTA 热点
 const CMD_STOP_AP = 'X'    // 关热点
 const CMD_VERSION = 'V'    // 问固件版本号 (回包第一字节还是 'V', 后面跟版本字符串)
+const CMD_LOG = 'L'        // 取 485 总线日志 (带参数 = 从第几个字节开始)
 
 // 电池消息类型 —— 对应固件 ble_telemetry.h 的 BLE_BMSG_*
 const BMSG_STATUS = 1
 const BMSG_CELLS = 2
 const BMSG_MODEL = 3
+const BMSG_DIAG = 4
 
 // 把微信的 errMsg 翻译成人能动手解决的一句话.
 // BLE 这边最容易卡在权限上, 不翻译的话用户只看到 "openBluetoothAdapter:fail user deny"
@@ -303,6 +306,21 @@ async function writeCommand(deviceId, cmdChar, byte) {
   })
 }
 
+// 往命令特征写 3 字节: [命令][参数 u16 小端] —— 现在只有取日志用 ('L' + 起始偏移)
+async function writeCommandWithArg(deviceId, cmdChar, byte, arg) {
+  const buf = new Uint8Array(3)
+  buf[0] = byte.charCodeAt(0)
+  buf[1] = arg & 0xFF
+  buf[2] = (arg >> 8) & 0xFF
+  await call('writeBLECharacteristicValue', {
+    deviceId,
+    serviceId: cmdChar.serviceId,
+    characteristicId: cmdChar.characteristicId,
+    value: buf.buffer,
+    writeType: 'write',
+  })
+}
+
 // 解析遥测载荷 (20 字节小端; 前 12 字节是旧格式, 老固件也认)
 function parseTelemetry(buffer) {
   const v = new DataView(buffer)
@@ -376,6 +394,7 @@ function createBatteryState() {
     status: null,
     cells: [],
     model: '',
+    diag: null,      // 诊断计数 (为什么没电池数据)
     pending: {},     // 类型 → {total, chunks:[]}
   }
 }
@@ -437,9 +456,102 @@ function handleBatteryChunk(state, buffer, onUpdate) {
     state.cells = cells
   } else if (type === BMSG_MODEL) {
     state.model = String.fromCharCode.apply(null, payload)
+  } else if (type === BMSG_DIAG && payload.length >= 16) {
+    // 诊断: 回答"为什么没有电池数据"
+    const v = new DataView(payload.buffer, payload.byteOffset, payload.byteLength)
+    const age = v.getUint32(8, true)
+    state.diag = {
+      rxFrames: v.getUint16(0, true),
+      okFrames: v.getUint16(2, true),
+      csErr: v.getUint8(4),
+      lenErr: v.getUint8(5),
+      unknownLen: v.getUint8(6),
+      lastLen: v.getUint8(7),
+      ageMs: age === 0xFFFFFFFF ? -1 : age,
+      qCount: v.getUint16(12, true),
+      aCount: v.getUint16(14, true),
+    }
   }
 
   if (onUpdate) onUpdate(state)
+}
+
+/**
+ * 解析 485 日志包.
+ *
+ * 固件那边 (ble_telemetry.h 的 pumpLog) 一个包的格式:
+ *   [0]      'L' (0x4C)
+ *   [1]      flags, bit0 = 这是最后一个包
+ *   [2..5]   本包文本在整份日志里的字节偏移 (u32 小端)
+ *   [6..9]   整份日志的文本总长 (u32 小端)
+ *   [10..]   文本 (ASCII)
+ *
+ * 带偏移是故意的: 蓝牙通知可能丢包, 有了偏移手机才能发现缺口, 然后让设备从缺的地方重发.
+ */
+function parseLogPacket(buffer) {
+  if (!buffer || buffer.byteLength < 10) return null
+  const bytes = new Uint8Array(buffer)
+  if (bytes[0] !== 0x4C) return null
+  const v = new DataView(buffer)
+  const offset = v.getUint32(2, true)
+  const total = v.getUint32(6, true)
+  let text = ''
+  for (let i = 10; i < bytes.length; i++) text += String.fromCharCode(bytes[i])
+  return { last: !!(bytes[1] & 0x01), offset: offset, total: total, text: text }
+}
+
+/**
+ * 把日志写成手机里的文件, 再用微信分享出去.
+ *
+ * 为什么必须走"分享": 小程序的沙箱文件在手机上和电脑上都不存在,
+ * 唯一能把它弄到电脑上的办法就是发进微信聊天 (文件传输助手), 电脑上再保存.
+ * wx.shareFileMessage 是 2.8.0 才有的 API, 老微信上没有 —— 所以要 typeof 检查,
+ * 没有就退回"复制文本到剪贴板" (纯文本日志一样能粘到电脑上分析).
+ */
+function saveLogFile(text, filename) {
+  return new Promise((resolve, reject) => {
+    if (typeof wx.getFileSystemManager !== 'function') {
+      reject(new Error('这个微信版本不支持写文件'))
+      return
+    }
+    const path = wx.env.USER_DATA_PATH + '/' + filename
+    wx.getFileSystemManager().writeFile({
+      filePath: path,
+      data: text,
+      encoding: 'utf8',
+      success: () => resolve(path),
+      fail: (err) => reject(new Error('写文件失败: ' + ((err && err.errMsg) || ''))),
+    })
+  })
+}
+
+function shareLogFile(path, filename) {
+  return new Promise((resolve, reject) => {
+    if (typeof wx.shareFileMessage !== 'function') {
+      reject(new Error('这个微信版本不支持分享文件 (基础库要 2.8.0 以上)'))
+      return
+    }
+    wx.shareFileMessage({
+      filePath: path,
+      filename: filename,
+      success: resolve,
+      fail: (err) => reject(new Error((err && err.errMsg) || '分享失败')),
+    })
+  })
+}
+
+function copyText(text) {
+  return new Promise((resolve, reject) => {
+    if (typeof wx.setClipboardData !== 'function') {
+      reject(new Error('这个微信版本不支持剪贴板'))
+      return
+    }
+    wx.setClipboardData({
+      data: text,
+      success: resolve,
+      fail: (err) => reject(new Error((err && err.errMsg) || '复制失败')),
+    })
+  })
 }
 
 module.exports = {
@@ -448,10 +560,12 @@ module.exports = {
   FRAME_UUID,
   BATTERY_UUID,
   CMD_UUID,
+  LOG_UUID,
   NAME_PREFIX,
   CMD_START_AP,
   CMD_STOP_AP,
   CMD_VERSION,
+  CMD_LOG,
   openAdapter,
   closeAdapter,
   discover,
@@ -462,9 +576,14 @@ module.exports = {
   subscribe,
   findCharacteristic,
   writeCommand,
+  writeCommandWithArg,
   parseTelemetry,
   bufferToHex,
   parseCmdReply,
   createBatteryState,
   handleBatteryChunk,
+  parseLogPacket,
+  saveLogFile,
+  shareLogFile,
+  copyText,
 }

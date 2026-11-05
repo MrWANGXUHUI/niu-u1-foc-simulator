@@ -21,6 +21,7 @@ let state = {
   deviceName: '',
   error: '',
   hasCommand: false,   // 固件里有没有命令特征 (1.4.0 才有)
+  hasLog: false,       // 固件里有没有 485 日志特征 (1.5.0 才有)
   fwVersion: '',       // 固件版本号 (1.4.0 才有, 通过命令特征问出来)
 }
 
@@ -79,6 +80,7 @@ function registerNotifyHandler() {
     if (uuid === ble.TELEMETRY_UUID.toLowerCase()) emitData('telemetry', res.value)
     else if (uuid === ble.FRAME_UUID.toLowerCase()) emitData('frame', res.value)
     else if (uuid === ble.BATTERY_UUID.toLowerCase()) emitData('battery', res.value)
+    else if (uuid === ble.LOG_UUID.toLowerCase()) emitData('log', res.value)
     else if (uuid === ble.CMD_UUID.toLowerCase()) {
       // 版本号直接进状态里 —— 页面只要看 state 就行, 不用自己去解包
       const reply = ble.parseCmdReply(res.value)
@@ -126,12 +128,17 @@ async function connect() {
     registerStateHandler()
     await ble.subscribe(dev.deviceId, ble.TELEMETRY_UUID)
     await ble.subscribe(dev.deviceId, ble.FRAME_UUID)
-    // 电池 / 命令特征是后来加的, 老固件没有 —— 缺了不影响看车速
+    // 电池 / 命令 / 日志特征是后来加的, 老固件没有 —— 缺了不影响看车速
     try { await ble.subscribe(dev.deviceId, ble.BATTERY_UUID) } catch (e) {}
     let hasCommand = false
     try {
       await ble.subscribe(dev.deviceId, ble.CMD_UUID)
       hasCommand = true
+    } catch (e) {}
+    let hasLog = false
+    try {
+      await ble.subscribe(dev.deviceId, ble.LOG_UUID)
+      hasLog = true
     } catch (e) {}
 
     setState({
@@ -140,6 +147,7 @@ async function connect() {
       deviceName: dev.name,
       error: '',
       hasCommand: hasCommand,
+      hasLog: hasLog,
       fwVersion: '',
     })
 
@@ -173,6 +181,20 @@ async function sendCommand(byte) {
   await ble.writeCommand(state.deviceId, cmdChar, byte)
 }
 
+/**
+ * 让设备把 485 总线日志发过来 (设备端冻结日志, 一块一块往回推).
+ * offset = 从整份日志的第几个字节开始 —— 收到缺口时用这个让设备重发缺的部分.
+ * release = true 表示拉完了, 让设备解冻恢复记录.
+ */
+async function requestLog(offset, release) {
+  if (state.status !== 'connected' || !state.deviceId) {
+    throw new Error('还没连上设备')
+  }
+  const cmdChar = await ble.findCharacteristic(state.deviceId, ble.CMD_UUID)
+  const arg = release ? 0xFFFF : (offset | 0)
+  await ble.writeCommandWithArg(state.deviceId, cmdChar, ble.CMD_LOG, arg)
+}
+
 module.exports = {
   getState,
   onState,
@@ -180,4 +202,5 @@ module.exports = {
   connect,
   disconnect,
   sendCommand,
+  requestLog,
 }

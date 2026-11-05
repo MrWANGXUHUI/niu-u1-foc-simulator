@@ -66,6 +66,19 @@
     <view wx:if="{{!bmsHasData}}" class="tip">
       没收到电池报文 —— BMS 只在 V35 轮询它的时候才回话, 车得通电才行.
     </view>
+    <!-- 诊断: 电池没数据时, 这几行直接说明是哪一环断了 -->
+    <view class="row" wx:if="{{bmsDiagText}}">
+      <text class="label">BMS 应答</text>
+      <text class="value">{{bmsDiagText}}</text>
+    </view>
+    <view class="row" wx:if="{{bmsDiagDetail}}">
+      <text class="label">解析错误</text>
+      <text class="value">{{bmsDiagDetail}}</text>
+    </view>
+    <view class="row" wx:if="{{bmsAgeText}}">
+      <text class="label">最近一次</text>
+      <text class="value">{{bmsAgeText}}</text>
+    </view>
     <block wx:if="{{bmsHasData}}">
       <view class="soc-bar"><view class="soc-fill" style="width:{{socWidth}}"></view></view>
       <view class="row">
@@ -143,6 +156,18 @@
         <view wx:for="{{frames}}" wx:key="*this" class="log-line mono">{{item}}</view>
       </scroll-view>
     </block>
+
+    <!-- 保存日志: 拉设备端记的完整 485 日志 (下面这些原始帧只是采样, 不够分析用) -->
+    <view class="log-actions">
+      <button class="ghost" bindtap="onSaveLog" disabled="{{logBusy}}" loading="{{logBusy}}">
+        {{logBusy ? '正在拉取…' : '保存 485 日志'}}
+      </button>
+      <view class="tip" wx:if="{{logStatus}}">{{logStatus}}</view>
+      <view class="tip" wx:elif="{{!logBusy}}">
+        拉的是板子上记的完整日志 (每一帧都带毫秒时间戳, 含我们自己的应答),
+        存成文件后发到微信就能在电脑上离线分析.
+      </view>
+    </view>
   </view>
 
 </block>

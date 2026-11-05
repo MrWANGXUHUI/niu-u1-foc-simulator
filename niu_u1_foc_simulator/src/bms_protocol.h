@@ -77,6 +77,24 @@ struct BmsInfo {
     char     model[BMS_MODEL_CHARS + 1];
 };
 
+// BMS 解析诊断计数 —— 推给小程序, 用来回答"到底为什么没有电池数据".
+//
+// 「没收到电池报文」是个笼统的现象, 光看它没法动手. 这几个计数能把可能性拆开:
+//   rxFrames  = 0            → 总线上根本没有 BMS 应答 (BMS 没回话 / 我们的分帧把它吃了)
+//   rxFrames > 0, okFrames=0 → 帧收到了但解析不出来 (校验和错 = 被干扰/被撞坏)
+//   okFrames > 0             → 固件这边完全正常, 问题在蓝牙这一段 (通知没送到手机)
+struct BmsDiag {
+    uint16_t rxFrames;     // 总线上看到的 BMS 帧数
+    uint16_t okFrames;     // 解析成功数
+    uint8_t  csErr;        // 校验和错的帧数
+    uint8_t  lenErr;       // 长度字段对不上的帧数
+    uint8_t  unknownLen;   // 是 BMS 应答但数据区长度没见过
+    uint8_t  lastLen;      // 上次看到的 BMS 帧的总长度
+    uint32_t ageMs;        // 距上次看到 BMS 帧过了多少毫秒 (0xFFFFFFFF = 从来没有)
+    uint16_t qCount;       // 收到 V35 状态查询的次数
+    uint16_t aCount;       // 我们回出去的应答次数
+};
+
 // 帧头/帧尾/地址/功能码/长度
 static inline bool bmsIsReplyFrame(const uint8_t* raw, size_t len) {
     return len >= 9
@@ -94,15 +112,29 @@ static inline bool bmsChecksumOk(const uint8_t* raw, size_t len) {
     return (sum & 0xFF) == raw[len - 2];
 }
 
-// 解析一帧 BMS 应答. 返回 true 表示这帧是我们认识的 BMS 应答.
+// 解析结果 —— 不只是"成没成功", 还要说清楚**为什么**没成功.
+// 小程序上"没收到电池报文"是个笼统的现象, 光看它没法动手:
+//   BMS_PARSE_OK        = 解析出来了 (数据没问题)
+//   BMS_PARSE_NOT_BMS   = 这压根不是 BMS 应答 (地址/功能码不对)
+//   BMS_PARSE_BAD_CS    = 是 BMS 应答, 但校验和不对 → 总线被干扰了, 或者帧被撞坏
+//   BMS_PARSE_BAD_LEN   = 是 BMS 应答, 但长度字段和实际帧长对不上 → 帧被截断/拼错
+//   BMS_PARSE_UNKNOWN   = 是 BMS 应答, 校验和也对, 但数据区长度没见过 → 协议有变化
+// 把这几个计数推给手机, 一眼就能分清"总线根本没数据" / "数据被干扰了" / "我们解析不了".
+#define BMS_PARSE_OK        1
+#define BMS_PARSE_NOT_BMS   0
+#define BMS_PARSE_BAD_CS    2
+#define BMS_PARSE_BAD_LEN   3
+#define BMS_PARSE_UNKNOWN   4
+
+// 解析一帧 BMS 应答. 返回 BMS_PARSE_* 之一.
 // 数据区每个字节发送时 +0x33 混淆, 这里 -0x33 反混淆.
-static inline bool bmsParseFrame(const uint8_t* raw, size_t len, BmsInfo* out) {
-    if (!out || !bmsIsReplyFrame(raw, len)) return false;
-    if (!bmsChecksumOk(raw, len)) return false;
+static inline int bmsParseFrame(const uint8_t* raw, size_t len, BmsInfo* out) {
+    if (!out || !bmsIsReplyFrame(raw, len)) return BMS_PARSE_NOT_BMS;
+    if (!bmsChecksumOk(raw, len)) return BMS_PARSE_BAD_CS;
 
     uint8_t dataLen = raw[5];
-    if ((size_t)dataLen + 8 != len) return false;   // 长度字段和实际帧长对不上
-    if (dataLen > BMS_MAX_DATA_LEN) return false;   // 数据区比缓冲区还长 → 丢弃, 绝不能拷贝
+    if ((size_t)dataLen + 8 != len) return BMS_PARSE_BAD_LEN;   // 长度字段和实际帧长对不上
+    if (dataLen > BMS_MAX_DATA_LEN) return BMS_PARSE_BAD_LEN;   // 数据区比缓冲区还长 → 丢弃, 绝不能拷贝
 
     uint8_t plain[BMS_MAX_DATA_LEN];
     for (uint8_t i = 0; i < dataLen; i++) {
@@ -118,7 +150,7 @@ static inline bool bmsParseFrame(const uint8_t* raw, size_t len, BmsInfo* out) {
         for (uint8_t i = 0; i < BMS_TEMP_COUNT; i++) {
             out->temps[i] = (int8_t)plain[BMS_OFF_TEMPS + i];
         }
-        return true;
+        return BMS_PARSE_OK;
     }
 
     if (dataLen == BMS_CELLS_LEN) {
@@ -129,7 +161,7 @@ static inline bool bmsParseFrame(const uint8_t* raw, size_t len, BmsInfo* out) {
             if (mv == 0) break;              // 后面是保留的 0
             out->cellMv[out->cellCount++] = mv;
         }
-        return true;
+        return BMS_PARSE_OK;
     }
 
     if (dataLen == BMS_MODEL_LEN || dataLen == BMS_INFO_LEN) {
@@ -144,10 +176,10 @@ static inline bool bmsParseFrame(const uint8_t* raw, size_t len, BmsInfo* out) {
             out->model[n] = '\0';
             out->hasModel = true;
         }
-        return true;
+        return BMS_PARSE_OK;
     }
 
-    return false;
+    return BMS_PARSE_UNKNOWN;
 }
 
 #endif
