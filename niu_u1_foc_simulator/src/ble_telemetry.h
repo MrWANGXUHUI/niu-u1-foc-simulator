@@ -141,7 +141,13 @@ public:
         server->setCallbacks(&serverCb_);
         server_ = server;   // 留着: 日志传输要用它查对端协商出来的 MTU
 
-        BLEService* svc = server->createService(BLE_SERVICE_UUID);
+        // 服务要开够 handle: 每个特征占 3 个 (特征声明 + 值 + CCCD 描述符),
+        // 服务本身还要占 1 个. 库的默认值是 15 —— 4 个特征时刚好够用 (12+1),
+        // 加到第 5 个 (日志特征) 就不够了: esp_ble_gatts_add_char 失败, 特征建不出来.
+        // 症状特别坑: 前 4 个特征一切正常 (车速/电池都好), 只有第 5 个静默失灵 ——
+        // 手机订阅不到它, 板子往一个 handle 都没拿到的特征上发通知也发不出去,
+        // 表现就是"点保存日志永远在导出中". 这里给 25 个, 以后再加特征也够.
+        BLEService* svc = server->createService(BLEUUID(std::string(BLE_SERVICE_UUID)), 25);
 
         telemetry_ = svc->createCharacteristic(BLE_TELEMETRY_UUID,
                                                BLECharacteristic::PROPERTY_NOTIFY |
@@ -259,11 +265,12 @@ public:
     // ---- WiFi 热点遥控 (蓝牙优先方案的核心) ----
 
     // 命令回调只记下命令, 主循环 handle() 里执行, 回统一走 BLE 任务发
-    void queueCommand(uint8_t cmd, uint16_t arg, bool hasArg) {
+    void queueCommand(uint8_t cmd, uint16_t arg, bool hasArg, uint16_t mtu = 0) {
         lock();
         cmdByte_ = cmd;
         cmdArg_ = arg;
         cmdHasArg_ = hasArg;
+        cmdMtu_ = mtu;
         cmdPending_ = true;
         unlock();
     }
@@ -286,9 +293,9 @@ public:
         unsigned long now = millis();
 
         if (cmdPending_) {
-            uint8_t cmd; uint16_t arg; bool hasArg;
+            uint8_t cmd; uint16_t arg; bool hasArg; uint16_t mtu;
             lock();
-            cmd = cmdByte_; arg = cmdArg_; hasArg = cmdHasArg_;
+            cmd = cmdByte_; arg = cmdArg_; hasArg = cmdHasArg_; mtu = cmdMtu_;
             cmdPending_ = false;
             unlock();
 
@@ -309,11 +316,14 @@ public:
                     unlock();
                 }
             } else if (cmd == BleCommand::CMD_LOG) {
-                // 取 485 日志: 参数是"从第几个字节开始拉", 0xFFFF = 拉完了, 解冻
+                // 取 485 日志: 参数是"从第几个字节开始拉", 0xFFFF = 拉完了, 解冻.
+                // mtu 是手机那边协商出来的 MTU —— 手机知道得更准 (iOS 上有时
+                // 板子这边看到的还是默认值), 拿它决定一个包带多少字节.
                 lock();
                 logReqPending_ = true;
                 logReqOffset_ = arg;
                 logReqRelease_ = (hasArg && arg == BLE_LOG_ARG_RELEASE);
+                logMtu_ = mtu;
                 unlock();
             } else if (apToggle_) {
                 apToggle_(cmd == BleCommand::CMD_START_AP);
@@ -560,9 +570,14 @@ private:
         return 23;
     }
 
-    // 一个日志包能带多少字节文本
+    // 一个日志包能带多少字节文本.
+    //
+    // MTU 取"板子看到的"和"手机报的"里**小**的那个 —— 保守一点:
+    // 包超过对端真正能吃的大小时, 蓝牙协议栈会把它**截断**发出去, 手机收到的是
+    // 半个包, 偏移对不上 → 手机以为丢包 → 一直要求重发 → 永远拉不完.
     size_t logTextCapacity() {
         uint16_t mtu = peerMtu();
+        if (logMtu_ >= 23 && logMtu_ < mtu) mtu = logMtu_;
         size_t cap = (mtu > 3) ? (size_t)(mtu - 3) : 20;
         if (cap > 180) cap = 180;               // 别超过对端一般能吃的量
         if (cap <= BLE_LOG_HDR) cap = BLE_LOG_HDR + 8;
@@ -648,11 +663,13 @@ private:
         logChar_->notify();
 
         logSentBytes_ += (uint32_t)n;
+        // 每发一块就续一次命 —— 传输慢的时候 (比如对端 MTU 很小, 一包只带十来个字节,
+        // 整份日志要传几十秒) 不能因为"手机没再发请求"就把传输掐了.
+        logLastReqMs_ = now;
         if (done) {
             // 最后一块. 日志继续冻着 (手机要是发现缺口还能让我们重发),
-            // 等手机发"拉完了" (0xFFFF) 或者超时 20 秒再解冻.
+            // 等手机发"拉完了" (0xFFFF) 或者超时再解冻.
             logFinished_ = true;
-            logLastReqMs_ = millis();
         }
         return true;
     }
@@ -740,6 +757,7 @@ private:
     uint8_t cmdByte_ = 0;
     uint16_t cmdArg_ = 0;
     bool cmdHasArg_ = false;
+    uint16_t cmdMtu_ = 0;
     bool cmdPending_ = false;
     ApToggleFn apToggle_ = nullptr;
     VersionFn versionFn_ = nullptr;
@@ -765,6 +783,7 @@ private:
     bool     logReqPending_ = false;
     bool     logReqRelease_ = false;
     uint16_t logReqOffset_ = 0;
+    uint16_t logMtu_ = 0;        // 手机报上来的 MTU (0 = 不知道)
     unsigned long logLastReqMs_ = 0;
     unsigned long logLastPktMs_ = 0;
     uint32_t logTotalBytes_ = 0;
@@ -781,6 +800,7 @@ inline void BleCmdCb::onWrite(BLECharacteristic* ch, esp_ble_gatts_cb_param_t* p
     if (len == 0) return;
     uint8_t cmd;
     uint16_t arg = 0;
+    uint16_t mtu = 0;
     bool hasArg = false;
     if (len >= 3) {
         // 带参数: [0]=命令 [1..2]=参数 (小端 u16).
@@ -788,12 +808,16 @@ inline void BleCmdCb::onWrite(BLECharacteristic* ch, esp_ble_gatts_cb_param_t* p
         cmd = param->write.value[0];
         arg = (uint16_t)param->write.value[1] | ((uint16_t)param->write.value[2] << 8);
         hasArg = true;
+        if (len >= 5) {
+            // 再带 2 字节: 手机协商出来的 MTU (小端 u16)
+            mtu = (uint16_t)param->write.value[3] | ((uint16_t)param->write.value[4] << 8);
+        }
     } else {
         // 取最后一个字节: 小程序写 1 字节就是它自己; 而 gatttool 之类的工具写 "0x57"
         // 会被当成 2 字节大端 (00 57), 取头就拿到 0x00 了.
         cmd = param->write.value[len - 1];
     }
-    owner_->queueCommand(cmd, arg, hasArg);
+    owner_->queueCommand(cmd, arg, hasArg, mtu);
     Serial.printf("[BLE] 命令 0x%02X 已排队 (arg=%u)\n", cmd, (unsigned)arg);
 }
 

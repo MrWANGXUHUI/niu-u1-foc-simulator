@@ -192,7 +192,9 @@ async function requestLog(offset, release) {
   }
   const cmdChar = await ble.findCharacteristic(state.deviceId, ble.CMD_UUID)
   const arg = release ? 0xFFFF : (offset | 0)
-  await ble.writeCommandWithArg(state.deviceId, cmdChar, ble.CMD_LOG, arg)
+  // 把手机协商出来的 MTU 一起告诉设备: 一个包带多少字节, 取决于对端能吃多大的包.
+  // 报大了会被蓝牙协议栈截断, 手机收到半个包 → 偏移对不上 → 永远拉不完.
+  await ble.writeCommandWithArg(state.deviceId, cmdChar, ble.CMD_LOG, arg, ble.getPeerMtu())
 }
 
 module.exports = {

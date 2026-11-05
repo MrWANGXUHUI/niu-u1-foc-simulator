@@ -81,6 +81,10 @@
     </view>
     <block wx:if="{{bmsHasData}}">
       <view class="soc-bar"><view class="soc-fill" style="width:{{socWidth}}"></view></view>
+      <!-- 趋势图: 电量% + 总电压, 两块面板各自一个纵轴 -->
+      <view class="chart-wrap">
+        <canvas canvas-id="bmsChart" id="bmsChart" class="bms-chart"></canvas>
+      </view>
       <view class="row">
         <text class="label">总电压 / 电流</text>
         <text class="value">{{bmsVoltage}} V / {{bmsCurrent}} A</text>
@@ -122,6 +126,10 @@
         <text class="value">{{pollHz}}</text>
       </view>
       <view class="row">
+        <text class="label">测速波动 (5 秒)</text>
+        <text class="value">{{speedJitter}} km/h</text>
+      </view>
+      <view class="row">
         <text class="label">霍尔脉冲 / 间隔</text>
         <text class="value">{{pulseCount}} / {{intervalMs}} ms</text>
       </view>
@@ -159,10 +167,14 @@
 
     <!-- 保存日志: 拉设备端记的完整 485 日志 (下面这些原始帧只是采样, 不够分析用) -->
     <view class="log-actions">
-      <button class="ghost" bindtap="onSaveLog" disabled="{{logBusy}}" loading="{{logBusy}}">
+      <button class="ghost" bindtap="onSaveLog" disabled="{{logBusy || !logSupported}}" loading="{{logBusy}}">
         {{logBusy ? '正在拉取…' : '保存 485 日志'}}
       </button>
-      <view class="tip" wx:if="{{logStatus}}">{{logStatus}}</view>
+      <view class="tip err" wx:if="{{logError}}">{{logError}}</view>
+      <view class="tip" wx:if="{{!logSupported}}">
+        车上的固件没有日志功能 (1.5.0 才有) —— 先去「升级」页把固件推上去.
+      </view>
+      <view class="tip" wx:elif="{{logStatus}}">{{logStatus}}</view>
       <view class="tip" wx:elif="{{!logBusy}}">
         拉的是板子上记的完整日志 (每一帧都带毫秒时间戳, 含我们自己的应答),
         存成文件后发到微信就能在电脑上离线分析.

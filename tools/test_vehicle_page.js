@@ -7,6 +7,7 @@
 
 const path = require('path')
 const Module = require('module')
+const ble = require(path.join(__dirname, '..', 'miniprogram', 'utils', 'ble.js'))
 
 let fail = 0
 function check(name, got, want) {
@@ -28,6 +29,18 @@ global.wx = {
   showToast: (o) => { toasts.push(o.title); o.success && o.success(); },
   showActionSheet: (o) => { shown.push(o.itemList); o.fail && o.fail({}); },
   showModal: (o) => { shown.push(o.content); o.fail && o.fail({}); },
+  // 趋势图: 假的 canvas
+  createSelectorQuery: () => ({
+    in() { return this },
+    select() { return this },
+    boundingClientRect(cb) { this._cb = cb; return this },
+    exec() { if (this._cb) this._cb({ width: 300, height: 110 }) },
+  }),
+  createCanvasContext: () => ({
+    setStrokeStyle() {}, setLineWidth() {}, setFillStyle() {}, setFontSize() {},
+    setTextAlign() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {},
+    arc() {}, fill() {}, fillRect() {}, fillText() {}, clearRect() {}, draw() {},
+  }),
 }
 let pageDef = null
 global.Page = (def) => { pageDef = def }
@@ -125,6 +138,37 @@ page.onLogPacket(logPacket(0, 100, 'AAAA', false))
 page.onLogPacket(logPacket(50, 100, 'BBBB', false))   // 缺口: 我们只有 4 个字节
 check('日志: 有缺口时按缺口位置要重发', requested && requested.offset === 4, true)
 check('日志: 有缺口时不误判成拉完', page.data.logStatus.indexOf('拉取中') === 0, true)
+
+// ---- 4) 趋势图: 电池数据进来要攒成历史点 ----
+function makeBatteryMsg(type, payload) {
+  const buf = Buffer.alloc(3 + payload.length)
+  buf[0] = type
+  buf[1] = 0
+  buf[2] = 1
+  payload.copy(buf, 3)
+  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length)
+}
+page.bmsPoints = []
+page.lastPointAt = 0
+const t0 = Date.now()
+function feedStatus(soc, volt) {
+  const st = Buffer.alloc(17)
+  st[0] = 0x01; st[1] = soc
+  st.writeUInt16LE(Math.round(volt * 10), 2)
+  st[6] = 0
+  st[12] = 13
+  const st2 = ble.createBatteryState()
+  ble.handleBatteryChunk(st2, makeBatteryMsg(1, st), () => {})
+  page.applyBattery(st2)
+}
+feedStatus(80, 48.6)
+check('趋势图: 收到电池状态要收一个点', page.bmsPoints.length, 1)
+check('趋势图: 点里带电量和电压',
+  [page.bmsPoints[0].soc, page.bmsPoints[0].volt], [80, 48.6])
+// 5 秒内再喂不应该重复收点
+page.lastPointAt = Date.now()
+feedStatus(79, 48.5)
+check('趋势图: 5 秒内不重复收点', page.bmsPoints.length, 1)
 
 console.log('\n' + (fail ? `✗ ${fail} 项没过` : '✓ 全部通过'))
 process.exit(fail ? 1 : 0)

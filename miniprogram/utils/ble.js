@@ -244,13 +244,24 @@ function libVersion() {
   return '未知'
 }
 
+// 跟手机协商出来的 MTU (字节). 0 = 还没连上 / 没问出来.
+// 取日志的时候要告诉设备: 一个包带多少字节取决于对端能吃多大的包,
+// 用错了会被蓝牙协议栈截断, 手机收到半个包 → 偏移对不上 → 永远拉不完.
+let peerMtu = 0
+
+function getPeerMtu() {
+  return peerMtu
+}
+
 async function connect(deviceId) {
   await call('createBLEConnection', { deviceId, timeout: 10000 })
   // iOS 上必须先问一次 MTU, 否则后面写不进去 (通知不需要, 但问一次更稳)
+  peerMtu = 0
   try {
-    await call('getBLEMTU', { deviceId, writeType: 'write' })
+    const res = await call('getBLEMTU', { deviceId, writeType: 'write' })
+    if (res && res.mtu) peerMtu = res.mtu
   } catch (e) {
-    // 安卓不支持 getBLEMTU, 忽略
+    // 安卓不支持 getBLEMTU, 忽略 (设备那边会用自己的默认值)
   }
 }
 
@@ -306,12 +317,15 @@ async function writeCommand(deviceId, cmdChar, byte) {
   })
 }
 
-// 往命令特征写 3 字节: [命令][参数 u16 小端] —— 现在只有取日志用 ('L' + 起始偏移)
-async function writeCommandWithArg(deviceId, cmdChar, byte, arg) {
-  const buf = new Uint8Array(3)
+// 往命令特征写 5 字节: [命令][参数 u16 小端][MTU u16 小端] —— 现在只有取日志用
+// ('L' + 起始偏移 + 协商出来的 MTU). MTU 传 0 = 设备自己想办法.
+async function writeCommandWithArg(deviceId, cmdChar, byte, arg, mtu) {
+  const buf = new Uint8Array(5)
   buf[0] = byte.charCodeAt(0)
   buf[1] = arg & 0xFF
   buf[2] = (arg >> 8) & 0xFF
+  buf[3] = (mtu || 0) & 0xFF
+  buf[4] = ((mtu || 0) >> 8) & 0xFF
   await call('writeBLECharacteristicValue', {
     deviceId,
     serviceId: cmdChar.serviceId,
@@ -577,6 +591,7 @@ module.exports = {
   findCharacteristic,
   writeCommand,
   writeCommandWithArg,
+  getPeerMtu,
   parseTelemetry,
   bufferToHex,
   parseCmdReply,

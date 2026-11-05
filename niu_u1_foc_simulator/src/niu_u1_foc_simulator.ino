@@ -179,6 +179,10 @@ static bool bms_seen = false;
 volatile uint32_t wheel_pulse_count = 0;
 volatile uint32_t last_pulse_us = 0;    // 最近一个脉冲的时刻
 volatile uint32_t prev_pulse_us = 0;    // 上一个脉冲的时刻 (两者之差 = 一圈时间)
+// 最近一次**可信**的间隔 (微秒). ISR 里的自适应毛刺闸门拿它当参照:
+// 比它短 40% 以上的脉冲一定是振铃, 不是真的转快了.
+// 主循环里算出可信间隔后更新 (volatile u32 写入在 ESP32 上是原子的, ISR 读安全).
+volatile uint32_t last_good_interval_us = 0;
 static uint32_t hall_hist_us[HALL_HISTORY] = {0};   // 最近几个间隔
 static uint8_t hall_hist_cnt = 0;
 static uint8_t hall_hist_idx = 0;
@@ -253,8 +257,23 @@ void updateWheelSpeed() {
             hallHistReset();
             hall_gap_reset++;
         } else {
-            hallHistPush(interval);
-            last_interval_us = interval;
+            // 第二道闸门 (自适应). ISR 里那道已经按"最近可信周期"挡过一遍了,
+            // 这里再按"最近中位数"挡一次 —— 双保险, 免得毛刺混进历史.
+            // 比中位数短 40% 以上的间隔, 物理上不可能是真加速
+            // (一个间隔里速度要翻一倍, 踏板车做不到).
+            uint32_t med = hallMedianInterval();
+            uint32_t min_ok = HALL_MIN_INTERVAL_US;
+            if (med > 0) {
+                uint32_t adaptive = med * 3 / 5;
+                if (adaptive > min_ok) min_ok = adaptive;
+            }
+            if (interval < min_ok) {
+                hall_glitch_count++;
+            } else {
+                hallHistPush(interval);
+                last_interval_us = interval;
+                last_good_interval_us = interval;   // 给 ISR 里的自适应闸门当参照
+            }
         }
     }
 
@@ -286,11 +305,25 @@ void IRAM_ATTR wheelPulseISR() {
     // 1ms 消抖: 单磁钢在 30km/h 下脉冲间隔约 154ms, 1ms 阈值不会漏计真实脉冲
     if (now - last_pulse_us > HALL_DEBOUNCE_US) {
         // 物理上不可能的快脉冲 → 判为毛刺 (振铃/干扰), 丢掉.
+        //
+        // 两道闸门:
+        //   1) 绝对阈值 25ms —— 挡 6ms 那种 (车速离谱 40 倍就是它)
+        //   2) 自适应阈值 = 最近可信周期的 60% —— 挡 50~60ms 那种.
+        //      骑车时真间隔是几百毫秒 (40km/h → 115ms), 振铃出来的脉冲能穿過
+        //      绝对阈值, 混进历史 → 中位数被污染 → 车速跳来跳去, 匀速骑一会才收敛.
+        //      参照量用"最近一次可信的间隔" (主循环里更新), 加速时它自己会跟着变小.
+        //
         // 关键: **丢掉时不更新 last_pulse_us / prev_pulse_us**.
         // 更新了的话, 一个毛刺会把一个真间隔劈成"几毫秒 + 剩下的"两半:
         // 短的进中位数历史, 长的又比真实值大 —— 车速两头都错.
         // 不更新, 下一个真脉冲算出来的间隔才是准的.
-        if (last_pulse_us != 0 && now - last_pulse_us < HALL_MIN_INTERVAL_US) {
+        uint32_t min_ok = HALL_MIN_INTERVAL_US;
+        uint32_t good = last_good_interval_us;
+        if (good > 0) {
+            uint32_t adaptive = good * 3 / 5;
+            if (adaptive > min_ok) min_ok = adaptive;
+        }
+        if (last_pulse_us != 0 && now - last_pulse_us < min_ok) {
             hall_glitch_count++;
             return;
         }

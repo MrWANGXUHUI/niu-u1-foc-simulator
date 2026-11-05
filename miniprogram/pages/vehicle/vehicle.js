@@ -1,5 +1,6 @@
 const ble = require('../../utils/ble')
 const bleLink = require('../../utils/bleLink')
+const chart = require('../../utils/chart')
 
 Page({
   data: {
@@ -29,6 +30,7 @@ Page({
     intervalMs: 0,
     glitchCount: 0,
     pollHz: '-',
+    speedJitter: '-',   // 最近 5 秒车速的波动幅度 (km/h)
 
     // 电池
     bmsHasData: false,
@@ -54,10 +56,16 @@ Page({
     // 485 日志
     logBusy: false,
     logStatus: '',
+    logSupported: true,    // 固件里有没有日志特征 (1.5.0 才有)
+    logError: '',
   },
 
   onLoad() {
     this.battery = ble.createBatteryState()
+    // 电池趋势图的数据点: 每 5 秒一个, 最多 120 个 (10 分钟)
+    this.bmsPoints = []
+    this.lastPointAt = 0
+    this.chartTimer = null
 
     // 连接状态: 订阅全局管理器, 两个页面共享同一条连接
     this.unsubState = bleLink.onState((s) => {
@@ -70,6 +78,7 @@ Page({
         connected: s.status === 'connected',
         busy: s.status === 'connecting',
         connectError: s.error || '',
+        logSupported: s.hasLog !== false,
       })
     })
 
@@ -82,9 +91,15 @@ Page({
     })
   },
 
+  onShow() {
+    // canvas 的内容切页面回来就没了, 重画一次
+    if (this.data.bmsHasData) this.scheduleChart()
+  },
+
   onUnload() {
     if (this.unsubState) this.unsubState()
     if (this.unsubData) this.unsubData()
+    this.stopLogWatchdog()
   },
 
   // ---------- 连接 ----------
@@ -121,6 +136,21 @@ Page({
     this.prevQ = t.qCount
     this.prevQt = now
 
+    // 测速波动: 最近 5 秒 (25 次通知) 里车速的最大最小差.
+    // 骑车时一眼看出稳不稳 —— 数值大就是传感器在抖/在漏脉冲.
+    this.speedHist = this.speedHist || []
+    this.speedHist.push(t.speed)
+    if (this.speedHist.length > 25) this.speedHist.shift()
+    let jitter = '-'
+    if (this.speedHist.length >= 5) {
+      let lo = Infinity, hi = -Infinity
+      for (const v of this.speedHist) {
+        if (v < lo) lo = v
+        if (v > hi) hi = v
+      }
+      jitter = (hi - lo).toFixed(1)
+    }
+
     this.setData({
       speed: t.speed.toFixed(1),
       rpm: String(t.rpm),
@@ -136,6 +166,7 @@ Page({
       intervalMs: t.intervalMs,
       glitchCount: t.glitchCount,
       pollHz: pollHz,
+      speedJitter: jitter,
     })
   },
 
@@ -180,6 +211,16 @@ Page({
     const s = state.status
     const cells = state.cells || []
     const d = state.diag
+    // 趋势图: 每 5 秒收一个点. 电量变化很慢, 不用每个通知都收.
+    if (s && s.hasData) {
+      const now = Date.now()
+      if (now - this.lastPointAt > 5000) {
+        this.lastPointAt = now
+        this.bmsPoints.push({ t: now, soc: s.soc, volt: s.voltage })
+        while (this.bmsPoints.length > 120) this.bmsPoints.shift()
+        this.scheduleChart()
+      }
+    }
     // 每节单体画一根柱子, 高度按最低/最高归一化
     const bars = []
     if (cells.length) {
@@ -228,14 +269,50 @@ Page({
       wx.showToast({ title: '还没连上设备', icon: 'none' })
       return
     }
+    if (!this.data.logSupported) {
+      // 固件里没有日志特征 —— 推上去的固件太老
+      wx.showModal({
+        title: '固件太老',
+        content: '车上的固件没有日志功能 (1.5.0 才有). 先去「升级」页把固件推上去.',
+        showCancel: false,
+      })
+      return
+    }
     this.logBuf = ''
     this.logTotal = 0
     this.logDone = false
-    this.setData({ logBusy: true, logStatus: '正在从设备拉取 485 日志…' })
+    this.setData({ logBusy: true, logStatus: '正在从设备拉取 485 日志…', logError: '' })
+    this.startLogWatchdog()
     try {
       await bleLink.requestLog(0, false)
     } catch (e) {
+      this.stopLogWatchdog()
       this.setData({ logBusy: false, logStatus: '拉取失败: ' + e.message })
+    }
+  },
+
+  // 看门狗: 迟迟收不到包就报错, 别让按钮一直转
+  // (以前就是"永远在导出中", 不知道卡在哪一步 —— 这次至少要说清楚)
+  startLogWatchdog() {
+    this.stopLogWatchdog()
+    this.logTimer = setTimeout(() => {
+      this.logTimer = null
+      if (this.logDone) return
+      const got = this.logBuf ? this.logBuf.length : 0
+      this.setData({
+        logBusy: false,
+        logError: got
+          ? `只收到 ${got} 字节就没下文了 (设备可能中途断开了)`
+          : '设备一个包都没发过来 —— 检查固件版本是不是 1.5.0 以上',
+      })
+      this.setData({ logStatus: '' })
+    }, 12000)
+  },
+
+  stopLogWatchdog() {
+    if (this.logTimer) {
+      clearTimeout(this.logTimer)
+      this.logTimer = null
     }
   },
 
@@ -253,6 +330,7 @@ Page({
     }
     this.logBuf += pkt.text
     this.logTotal = pkt.total
+    this.stopLogWatchdog()   // 有动静了, 重新计时
     this.setData({
       logStatus: `拉取中 ${(this.logBuf.length / 1024).toFixed(1)} / ${(pkt.total / 1024).toFixed(1)} KB`,
     })
@@ -263,6 +341,7 @@ Page({
   },
 
   async finishLog() {
+    this.stopLogWatchdog()
     const body = this.logBuf || ''
     const lines = body.split('\n').filter((l) => l.length)
     const header = [
@@ -318,6 +397,30 @@ Page({
     const p = (n) => ('0' + n).slice(-2)
     return '' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) +
       '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds())
+  },
+
+  // ---------- 电池趋势图 ----------
+  scheduleChart() {
+    if (this.chartTimer) return
+    this.chartTimer = setTimeout(() => {
+      this.chartTimer = null
+      this.drawChart()
+    }, 300)
+  },
+
+  drawChart() {
+    if (!this.data.bmsHasData) return
+    // 先问画布有多大 (rpx → px 要按实际布局算), 再画
+    wx.createSelectorQuery().in(this).select('#bmsChart').boundingClientRect((rect) => {
+      if (!rect || !rect.width || !rect.height) return
+      const ctx = wx.createCanvasContext('bmsChart', this)
+      chart.drawBmsChart(ctx, {
+        width: rect.width,
+        height: rect.height,
+        points: this.bmsPoints || [],
+      })
+      ctx.draw()
+    }).exec()
   },
 
   // ---------- 折叠 ----------

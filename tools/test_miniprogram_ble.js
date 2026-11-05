@@ -106,8 +106,11 @@ global.wx.getBLEDeviceCharacteristics = (o) =>
 
 ;(async () => {
   const cmdChar = await ble.findCharacteristic('devid', ble.CMD_UUID)
-  await ble.writeCommandWithArg('devid', cmdChar, ble.CMD_LOG, 0x1234)
-  check('命令带参数: [L][偏移小端]', Array.from(written), [0x4C, 0x34, 0x12])
+  await ble.writeCommandWithArg('devid', cmdChar, ble.CMD_LOG, 0x1234, 185)
+  check('命令带参数: [L][偏移小端][MTU 小端]',
+    Array.from(written), [0x4C, 0x34, 0x12, 0xB9, 0x00])
+  await ble.writeCommandWithArg('devid', cmdChar, ble.CMD_LOG, 0)
+  check('命令带参数: 不给 MTU 就是 0', Array.from(written), [0x4C, 0x00, 0x00, 0x00, 0x00])
   await ble.writeCommand('devid', cmdChar, ble.CMD_VERSION)
   check('命令单字节: [V]', Array.from(written), [0x56])
 
