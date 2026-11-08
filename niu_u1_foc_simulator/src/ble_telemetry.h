@@ -74,6 +74,9 @@
 #define BLE_LOG_PKT_GAP_MS  35
 // 拉取方多久不来要下一包就算拉完了 (ms) —— 到点解冻日志, 恢复记录
 #define BLE_LOG_IDLE_MS     20000
+// 最后一块发出去之后, 再留多久给手机补发缺块 (ms), 然后自动解冻日志.
+// 不能无限期冻着: 手机那边的"拉完了"命令不是唯一保障 (万一没送到, 日志就一直是旧的)
+#define BLE_LOG_SETTLE_MS   3000
 // 日志包头: [0]'L' [1]flags [2..5]偏移 [6..9]总长
 #define BLE_LOG_HDR         10
 // 'L' 命令的参数: 这个值表示"拉完了, 解冻"
@@ -412,8 +415,15 @@ private:
             notifyCmd(b, n + 1);
         }
 
-        // 3) 日志拉取 (用户主动点的, 优先级最高, 期间别发别的包抢带宽)
-        if (pumpLog()) return true;
+        // 3) 日志拉取 (用户主动点的).
+        //
+        // ⚠️ **绝不能因为"日志还在传"就 return 掉** ——
+        //    2026-11-06 踩过: 之前这里是 `if (pumpLog()) return true;`,
+        //    拉完日志之后 BLE 任务永远卡在"传输中", 遥测/电池再也不发了.
+        //    用户看到的症状是"速度固定在 19.6km/h 不动 + 电池没数据" ——
+        //    而固件其实活着 (485 应答一切正常, 抓的日志里能看到), 只是通知没发出去.
+        //    手机的"拉完了"命令只是加速手段, 不能是唯一保障.
+        bool logBusy = pumpLog();
 
         if (!connected_) return false;
 
@@ -453,8 +463,9 @@ private:
             sendBattery(snap.bms, snap.diag);
         }
 
-        // 6) 485 帧 (最新一帧, 分块推, 带块序号, 丢块手机能看出来)
-        if (snap.frameSeq != lastFrameSeq_) {
+        // 6) 485 帧 (最新一帧, 分块推, 带块序号, 丢块手机能看出来).
+        //    拉日志期间不发 —— 日志本身就是完整的 485 数据, 别抢带宽.
+        if (!logBusy && snap.frameSeq != lastFrameSeq_) {
             lastFrameSeq_ = snap.frameSeq;
             sendFrameChunks(snap.frame, snap.frameLen);
         }
@@ -604,17 +615,16 @@ private:
 
         if (req) {
             logLastReqMs_ = millis();
-            if (!logActive_) {
-                // 第一次拉: 冻结日志, 从头开始生成文本
+            if (offset == 0) {
+                // 新的拉取: 冻结日志, 从头开始 —— 拿的是**此刻**的内容
                 busLog().freeze(true);
-                logActive_ = true;
                 logCap_ = logTextCapacity();
                 logWriter_.begin(0);
                 logTotalBytes_ = logWriter_.total();
                 logSentBytes_ = 0;
                 logFinished_ = false;
-            }
-            if (offset > 0) {
+                logDoneAt_ = 0;
+            } else {
                 // 断点续传: 从头重新生成, 跳过前 offset 个字节.
                 // 日志是冻结的, 所以重新生成的文本跟刚才一模一样, 偏移对得上.
                 logWriter_.begin(offset);
@@ -622,20 +632,26 @@ private:
                 logSentBytes_ = offset;
                 logFinished_ = false;      // 还没发完, 继续发
             }
+            logActive_ = true;
         }
 
         if (!logActive_) return false;
 
         unsigned long now = millis();
+        if (logFinished_) {
+            // 最后一块已经发出去了. 给手机 3 秒补发缺块的机会, 然后自己收摊
+            // (解冻日志, 恢复记录). **不能无限期冻着** —— 手机那边要是没把
+            // "拉完了"送到 (那条命令不能是唯一保障), 日志就一直是旧的.
+            if (now - logDoneAt_ > BLE_LOG_SETTLE_MS) endLogTransfer();
+            return false;
+        }
         if (now - logLastReqMs_ > BLE_LOG_IDLE_MS) {
             // 手机半天不来要下一包 → 当作拉完了, 解冻恢复记录
             endLogTransfer();
             return false;
         }
-        // 最后一块已经发出去了, 别再发 (再发一个空包会让手机"保存完成"弹两次)
-        if (logFinished_) return true;
-        if (now - logLastPktMs_ < BLE_LOG_PKT_GAP_MS) return true;
-        if (!connected_ || !logChar_) return true;
+        if (now - logLastPktMs_ < BLE_LOG_PKT_GAP_MS) return false;
+        if (!connected_ || !logChar_) return false;
         logLastPktMs_ = now;
 
         // 生成一块文本
@@ -668,8 +684,9 @@ private:
         logLastReqMs_ = now;
         if (done) {
             // 最后一块. 日志继续冻着 (手机要是发现缺口还能让我们重发),
-            // 等手机发"拉完了" (0xFFFF) 或者超时再解冻.
+            // 3 秒后自动解冻 (或者等手机发"拉完了"那条命令).
             logFinished_ = true;
+            logDoneAt_ = now;
         }
         return true;
     }
@@ -784,6 +801,7 @@ private:
     bool     logReqRelease_ = false;
     uint16_t logReqOffset_ = 0;
     uint16_t logMtu_ = 0;        // 手机报上来的 MTU (0 = 不知道)
+    unsigned long logDoneAt_ = 0;  // 最后一块发出去的时刻
     unsigned long logLastReqMs_ = 0;
     unsigned long logLastPktMs_ = 0;
     uint32_t logTotalBytes_ = 0;

@@ -42,6 +42,32 @@ BMS_STATUS_LEN = 15
 BMS_CELLS_LEN = 40
 BMS_MODEL_LEN = 36
 BMS_INFO_LEN = 43
+BMS_FULL_LEN = 55      # 状态(15) + 单体(40) 拼在一帧里 (2026-11-06 真车日志发现)
+
+
+def bms_status_of(data):
+    """15 字节状态段 → 字典. 布局见 src/bms_protocol.h:
+    [0..1] 总电压(大端, 0.1V) [2..4] 未知 [5] 电流(A) [6] 电量% [7..9] 未知 [10..14] 5个温度"""
+    if len(data) < BMS_STATUS_LEN:
+        return None
+    cur = data[5] if data[5] < 128 else data[5] - 256
+    return {
+        'voltage': (data[0] << 8 | data[1]) / 10.0,
+        'current': cur,
+        'soc': data[6],
+        'temps': list(data[10:15]),
+    }
+
+
+def bms_cells_of(data):
+    """40 字节单体段 → 单体电压列表 (mV). 前面是大端 u16, 到第一个 0 为止"""
+    out = []
+    for i in range(0, len(data) - 1, 2):
+        mv = (data[i] << 8) | data[i + 1]
+        if mv == 0:
+            break
+        out.append(mv)
+    return out
 
 
 class Frame(object):
@@ -221,44 +247,48 @@ def main():
         print('  校验和错 = 总线上有干扰, 或者两台设备同时说话 (撞车了).')
         print('  撞车的常见原因: 我们应答晚了, 跟 BMS 的应答撞在一起 —— 看上面的延迟.')
 
+    # 55 字节的帧里同时含状态和单体电压 (这台车的 BMS 就是这么回的)
     status = [f for f in bms if f.length_ok() and len(f.data) == BMS_STATUS_LEN]
     cells = [f for f in bms if f.length_ok() and len(f.data) == BMS_CELLS_LEN]
+    full = [f for f in bms if f.length_ok() and len(f.data) == BMS_FULL_LEN]
     models = [f for f in bms if f.length_ok() and len(f.data) in (BMS_MODEL_LEN, BMS_INFO_LEN)]
     other = [f for f in bms if f.length_ok() and len(f.data) not in
-             (BMS_STATUS_LEN, BMS_CELLS_LEN, BMS_MODEL_LEN, BMS_INFO_LEN)]
-    print('应答里: 状态帧 %d, 单体电压帧 %d, 型号帧 %d, 数据长度没见过 %d'
-          % (len(status), len(cells), len(models), len(other)))
+             (BMS_STATUS_LEN, BMS_CELLS_LEN, BMS_MODEL_LEN, BMS_INFO_LEN, BMS_FULL_LEN)]
+    print('应答里: 状态帧 %d, 单体电压帧 %d, 状态+单体(55字节) %d, 型号帧 %d, 数据长度没见过 %d'
+          % (len(status), len(cells), len(full), len(models), len(other)))
     if other:
         print('  没见过的数据长度: %s'
               % ', '.join('%d 字节' % len(f.data) for f in other[:10]))
+    if full:
+        print('  → 55 字节那种是「15 字节状态 + 40 字节单体电压」拼在一起')
 
-    if status:
-        d = status[-1].data
-        volts = (d[0] << 8) | d[1]
-        cur = d[5] if d[5] < 128 else d[5] - 256
-        temps = d[10:15]
+    # 状态帧 (15 字节的单独状态, 或 55 字节那种的前 15 字节)
+    st_frames = list(status)
+    if full:
+        st_frames += full
+    if st_frames:
+        st = bms_status_of(st_frames[-1].data)
         print()
-        print('最近一次状态帧 (t=%d ms):' % status[-1].t)
+        print('最近一次状态 (t=%d ms):' % st_frames[-1].t)
         print('  总电压 %.1f V   电流 %d A   电量 %d%%'
-              % (volts / 10.0, cur, d[6]))
-        print('  温度 %s' % ' / '.join('%d°' % t for t in temps))
+              % (st['voltage'], st['current'], st['soc']))
+        print('  温度 %s' % ' / '.join('%d°' % t for t in st['temps']))
         # 状态帧间隔 —— 正常是 200~350ms 一次
-        if len(status) > 2:
-            gaps = [status[i].t - status[i - 1].t for i in range(1, len(status))]
+        if len(st_frames) > 2:
+            gaps = [st_frames[i].t - st_frames[i - 1].t for i in range(1, len(st_frames))]
             print('  状态帧间隔: 中位 %d ms, 最大 %d ms'
                   % (median(gaps), max(gaps)))
 
-    if cells:
-        d = cells[-1].data
-        mvs = []
-        for i in range(0, len(d) - 1, 2):
-            mv = (d[i] << 8) | d[i + 1]
-            if mv == 0:
-                break
-            mvs.append(mv)
+    # 单体电压 (40 字节的单独单体帧, 或 55 字节那种的后 40 字节)
+    cell_frames = list(cells)
+    if full:
+        cell_frames += full
+    if cell_frames:
+        d = cell_frames[-1].data
+        mvs = bms_cells_of(d[BMS_STATUS_LEN:] if len(d) == BMS_FULL_LEN else d)
         if mvs:
             print()
-            print('最近一次单体电压帧 (t=%d ms):' % cells[-1].t)
+            print('最近一次单体电压 (t=%d ms):' % cell_frames[-1].t)
             print('  %d 串, %.3f ~ %.3f V, 合计 %.2f V'
                   % (len(mvs), min(mvs) / 1000.0, max(mvs) / 1000.0,
                      sum(mvs) / 1000.0))

@@ -59,6 +59,42 @@ int main(int argc, char** argv) {
           info.temps[0] == 22 && info.temps[1] == 21 && info.temps[2] == 22 &&
           info.temps[3] == 21 && info.temps[4] == 20);
 
+    // ---- 55 字节的帧: 状态(15) + 单体电压(40) 拼在一起 ----
+    // 2026-11-06 真车日志里抓的原始数据 (这台车的 BMS 就是这么回的):
+    // V35 问的是 `2D 37` (文档记的那台车问的是 `2D 0F`), 回 55 字节.
+    // 我们原来只认 15/40/43 字节 → 整帧被丢 → 小程序上电量一直是空的.
+    {
+        std::vector<uint8_t> plain55 = {
+            0x01, 0xCD, 0x00, 0x00, 0x00, 0x66, 0x3F, 0x00, 0x01, 0x07,
+            0x04, 0x04, 0x04, 0x04, 0x06,
+            0x0D, 0x8F, 0x0D, 0x97, 0x0D, 0x9F, 0x0D, 0x9C, 0x0D, 0x94, 0x0D,
+            0x9E, 0x0D, 0xA4, 0x0D, 0xBC, 0x0D, 0xC3, 0x0D, 0xD9, 0x0D, 0x9E,
+            0x0D, 0x9F, 0x0D, 0xB6,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00
+        };
+        buildFrame(f, 0x31, 0xCE, 0x82, plain55);
+        check("55 字节帧: 整帧长度对", f.size() == 55 + 8);
+        BmsInfo info3 = {0};
+        int st3 = bmsParseFrame(f.data(), f.size(), &info3);
+        check("55 字节帧: 解析成功", st3 == BMS_PARSE_OK);
+        check("55 字节帧: 有状态", info3.hasStatus);
+        check("55 字节帧: 有单体电压", info3.hasCells);
+        check("55 字节帧: 总电压 46.1V", info3.voltage_dv == 461);
+        check("55 字节帧: 电量 63%", info3.soc == 63);
+        bool tempsOk = info3.temps[0] == 4 && info3.temps[1] == 4 &&
+                       info3.temps[2] == 4 && info3.temps[3] == 4 && info3.temps[4] == 6;
+        check("55 字节帧: 温度 4/4/4/4/6", tempsOk);
+        check("55 字节帧: 电流 10A (0.1A 一档)", info3.current == 10);
+        check("55 字节帧: 13 串", info3.cellCount == 13);
+        check("55 字节帧: 第一串 3471mV", info3.cellMv[0] == 3471);
+        {
+            uint32_t sum = 0;
+            for (uint8_t i = 0; i < info3.cellCount; i++) sum += info3.cellMv[i];
+            check("55 字节帧: 单体求和 45.44V", sum == 45442);
+        }
+    }
+
     // 校验和错的帧要能认出来 (不然分不清"没数据"和"数据被干扰了")
     std::vector<uint8_t> bad = f;
     bad[bad.size() - 2] ^= 0xFF;

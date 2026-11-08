@@ -20,7 +20,7 @@
 
 // 固件版本号, 通过 /ota/info、OLED 和蓝牙命令 'V' 三处暴露.
 // 不改 485 协议的 0x01 04 应答 (仍回 0x11), 免得破坏已经跑通的 V35 交互.
-#define OTA_FW_VERSION   "1.5.1"
+#define OTA_FW_VERSION   "1.5.2"
 
 // 单个 app 槽的大小上限 —— 必须跟 partitions.csv 里的 app0/app1 一致.
 // 超过就 Update.begin() 直接报 UPDATE_ERROR_SIZE.

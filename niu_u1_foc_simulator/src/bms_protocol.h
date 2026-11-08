@@ -44,6 +44,12 @@
 #define BMS_CELLS_LEN       40
 #define BMS_MODEL_LEN       36
 #define BMS_INFO_LEN        43
+// 状态 + 单体电压拼在一帧里 (55 字节).
+// 2026-11-06 抓真车日志发现的: 这台车的 V35 用 `2D 37` 问 BMS, BMS 回的是
+// **55 字节** —— 正好是"15 字节状态帧 + 40 字节单体电压帧"拼起来.
+// (文档里记的是 `2D 0F` → 15 字节状态, 另一台车/另一个 BMS 固件版本)
+// 我们原来只认 15/40/43 字节, 整帧被丢掉 → 小程序上电量一直是空的.
+#define BMS_FULL_LEN        55
 // 数据区的缓冲区上限. 必须 >= 上面所有已知帧长, 且要比 BMS_INFO_LEN 留余量 ——
 // 现在这个坑就是: 缓冲区刚好开成 43 (照着目前观测到的最大帧), 一个字节余量都没有,
 // BMS 只要回一帧数据区更长的应答就写穿栈, 板子直接 PANIC 重启.
@@ -57,6 +63,14 @@
 #define BMS_OFF_CURRENT     5
 #define BMS_OFF_SOC         6
 #define BMS_OFF_TEMPS       10
+
+// BMS 电流字节的单位: 除以这个数才是 A.
+// 文档 (xzfn/scooter-repair) 记的是"直接当 A", 但 2026-11-06 抓的**这台车**的日志里
+// 原始字节是 76~159 —— 按 A 算就是 46V × 159A = 7.3kW, 踏板车没那么大的功率.
+// 按 0.1A 算 (7.6~15.9A, 350~730W) 才合理.
+// 这台车的 BMS 跟文档那台不是一套 (它问 BMS 用的是 `2D 37`, 文档记的是 `2D 0F`),
+// 电流档位不一样不奇怪. 换台车要是不对, 把这个数改成 1.
+#define BMS_CURRENT_SCALE   10
 
 struct BmsInfo {
     // 状态帧 (15 字节)
@@ -126,6 +140,31 @@ static inline bool bmsChecksumOk(const uint8_t* raw, size_t len) {
 #define BMS_PARSE_BAD_LEN   3
 #define BMS_PARSE_UNKNOWN   4
 
+// 解析 15 字节状态段: [0..1]总电压(大端,0.1V) [2..4]未知 [5]电流(A)
+//                     [6]电量% [7..9]未知 [10..14] 5 个温度
+static inline void bmsParseStatus(const uint8_t* plain, BmsInfo* out) {
+    out->hasStatus = true;
+    out->voltage_dv = (uint16_t)((plain[BMS_OFF_VOLTAGE] << 8) | plain[BMS_OFF_VOLTAGE + 1]);
+    // 电流: 有符号 (充电是负的), 单位按 BMS_CURRENT_SCALE 换算
+    out->current  = (int16_t)((int8_t)plain[BMS_OFF_CURRENT]) / BMS_CURRENT_SCALE;
+    out->soc      = plain[BMS_OFF_SOC];
+    out->tempCount = BMS_TEMP_COUNT;
+    for (uint8_t i = 0; i < BMS_TEMP_COUNT; i++) {
+        out->temps[i] = (int8_t)plain[BMS_OFF_TEMPS + i];
+    }
+}
+
+// 解析 40 字节单体电压段: 前面是大端 u16 (mV), 一直到第一个 0 为止, 后面是保留的 0
+static inline void bmsParseCells(const uint8_t* plain, BmsInfo* out) {
+    out->hasCells = true;
+    out->cellCount = 0;
+    for (uint8_t i = 0; i + 1 < BMS_CELLS_LEN && out->cellCount < BMS_MAX_CELLS; i += 2) {
+        uint16_t mv = (uint16_t)((plain[i] << 8) | plain[i + 1]);
+        if (mv == 0) break;              // 后面是保留的 0
+        out->cellMv[out->cellCount++] = mv;
+    }
+}
+
 // 解析一帧 BMS 应答. 返回 BMS_PARSE_* 之一.
 // 数据区每个字节发送时 +0x33 混淆, 这里 -0x33 反混淆.
 static inline int bmsParseFrame(const uint8_t* raw, size_t len, BmsInfo* out) {
@@ -142,25 +181,19 @@ static inline int bmsParseFrame(const uint8_t* raw, size_t len, BmsInfo* out) {
     }
 
     if (dataLen == BMS_STATUS_LEN) {
-        out->hasStatus = true;
-        out->voltage_dv = (uint16_t)((plain[BMS_OFF_VOLTAGE] << 8) | plain[BMS_OFF_VOLTAGE + 1]);
-        out->current  = (int8_t)plain[BMS_OFF_CURRENT];
-        out->soc      = plain[BMS_OFF_SOC];
-        out->tempCount = BMS_TEMP_COUNT;
-        for (uint8_t i = 0; i < BMS_TEMP_COUNT; i++) {
-            out->temps[i] = (int8_t)plain[BMS_OFF_TEMPS + i];
-        }
+        bmsParseStatus(plain, out);
         return BMS_PARSE_OK;
     }
 
     if (dataLen == BMS_CELLS_LEN) {
-        out->hasCells = true;
-        out->cellCount = 0;
-        for (uint8_t i = 0; i < BMS_MAX_CELLS; i++) {
-            uint16_t mv = (uint16_t)((plain[i * 2] << 8) | plain[i * 2 + 1]);
-            if (mv == 0) break;              // 后面是保留的 0
-            out->cellMv[out->cellCount++] = mv;
-        }
+        bmsParseCells(plain, out);
+        return BMS_PARSE_OK;
+    }
+
+    if (dataLen == BMS_FULL_LEN) {
+        // 状态 + 单体电压拼在一帧里 (这台车的 BMS 就是这么回的)
+        bmsParseStatus(plain, out);
+        bmsParseCells(plain + BMS_STATUS_LEN, out);
         return BMS_PARSE_OK;
     }
 
