@@ -1,3 +1,6 @@
+// 多久收不到遥测就算"停滞" (ms)
+const STALL_MS = 4000
+
 const ble = require('../../utils/ble')
 const bleLink = require('../../utils/bleLink')
 const chart = require('../../utils/chart')
@@ -41,6 +44,7 @@ Page({
     bmsTemps: '',
     cellCount: 0,
     cellRange: '',
+    cellSpread: '',
     cells: [],
     cellBars: [],
     bmsModel: '',
@@ -52,6 +56,10 @@ Page({
     // 485 原始帧 (折叠)
     showFrames: false,
     frames: [],
+
+    // 数据停滞检测 —— 蓝牙通知链断了的时候, 光看数值是看不出来的
+    // (速度会一直显示最后一个收到的值, 看起来"卡住了")
+    stalled: false,
 
     // 485 日志
     logBusy: false,
@@ -69,6 +77,10 @@ Page({
 
     // 连接状态: 订阅全局管理器, 两个页面共享同一条连接
     this.unsubState = bleLink.onState((s) => {
+      if (s.status === 'connected') {
+        this.lastTelemetryAt = 0
+        setTimeout(() => this.checkStall(), 2500)
+      }
       this.setData({
         statusText: s.status === 'connected' ? '已连接'
           : s.status === 'connecting' ? '连接中…'
@@ -94,12 +106,47 @@ Page({
   onShow() {
     // canvas 的内容切页面回来就没了, 重画一次
     if (this.data.bmsHasData) this.scheduleChart()
+    // 回到前台: 通知链可能在后台断了, 立刻检查一次
+    this.checkStall()
+  },
+
+  // 停滞检测: 连着但收不到遥测 → 明确告诉用户, 而不是让速度冻在那儿装没事.
+  //
+  // 什么时候会发生: iOS 把小程序切到后台/锁屏时会挂起通知投递, 回来之后
+  // 有时连接还在但通知不来了. 表现就是"速度固定在某个值不动".
+  checkStall() {
+    if (this.stallTimer) { clearTimeout(this.stallTimer); this.stallTimer = null }
+    if (!this.data.connected) return
+    const last = this.lastTelemetryAt || 0
+    const silent = Date.now() - last
+    if (last && silent > STALL_MS) {
+      if (!this.data.stalled) {
+        this.setData({ stalled: true })
+        console.warn('遥测停滞', silent, 'ms 没有收到数据')
+      }
+    } else if (!last) {
+      // 连上了但一帧遥测都没收到 —— 也算停滞
+      if (!this.data.stalled) this.setData({ stalled: true })
+    } else if (this.data.stalled) {
+      // 数据又回来了 → 清掉标记 (正常情况下 onTelemetry 里就会清, 这里兜个底)
+      this.setData({ stalled: false })
+    }
+    this.stallTimer = setTimeout(() => this.checkStall(), 2000)
+  },
+
+  onStallReconnect() {
+    wx.showToast({ title: '正在重连…', icon: 'none' })
+    bleLink.disconnect()
+    setTimeout(() => {
+      this.onConnect()
+    }, 500)
   },
 
   onUnload() {
     if (this.unsubState) this.unsubState()
     if (this.unsubData) this.unsubData()
     this.stopLogWatchdog()
+    if (this.stallTimer) { clearTimeout(this.stallTimer); this.stallTimer = null }
   },
 
   // ---------- 连接 ----------
@@ -135,6 +182,17 @@ Page({
     }
     this.prevQ = t.qCount
     this.prevQt = now
+    // 记一份 App 侧最后收到的值. 导出 485 日志时写进文件头 ——
+    // 跟固件自己报的值一比就知道"是 App 侧断了还是设备侧断了":
+    //   固件报 2.4 km/h, App 显示 19.6 → App 侧的陈旧数据 (蓝牙通知链断了)
+    this.lastTelemetry = {
+      speed: t.speed,
+      protocolSpeed: t.protocolSpeed,
+      rpm: t.rpm,
+      at: now,
+    }
+    if (this.data.stalled) this.setData({ stalled: false })
+    this.lastTelemetryAt = now
 
     // 测速波动: 最近 5 秒 (25 次通知) 里车速的最大最小差.
     // 骑车时一眼看出稳不稳 —— 数值大就是传感器在抖/在漏脉冲.
@@ -221,16 +279,30 @@ Page({
         this.scheduleChart()
       }
     }
-    // 每节单体画一根柱子, 高度按最低/最高归一化
+    // 每节单体画一根柱子, 高度按最低/最高归一化.
+    //
+    // ⚠️ 标签宽度这件事踩过坑 (2026-11-09 用户反馈"电压更低的串柱子却更高"):
+    //   13 个标签 "3.618" 挤在 ~20pt 宽的柱子里, 窄屏上 (iPhone SE 320pt 宽)
+    //   标签的**排版宽度**会超出柱子 → 文字压到隔壁柱子上 → 看着就"对不上".
+    //   注意 `transform: scale()` 只缩渲染不缩排版, 救不了这个.
+    //   所以: 字号压到 12rpx (5 个字 ≈ 18pt, 320pt 的窄屏也放得下) + 点柱子看详情.
     const bars = []
+    let cellSpread = ''
     if (cells.length) {
       const min = Math.min.apply(null, cells)
       const max = Math.max.apply(null, cells)
       const span = Math.max(max - min, 0.02)   // 防止全一样时除零
+      const avg = cells.reduce((a, b) => a + b, 0) / cells.length
       for (let i = 0; i < cells.length; i++) {
         const h = 20 + Math.round(((cells[i] - min) / span) * 60)
-        bars.push({ i: i, v: cells[i].toFixed(3), h: h + 'rpx' })
+        bars.push({
+          i: i,
+          v: cells[i].toFixed(3),
+          d: Math.round((cells[i] - avg) * 1000),   // 相对平均的偏差 (mV)
+          h: h + 'rpx',
+        })
       }
+      cellSpread = '最大差 ' + Math.round((max - min) * 1000) + ' mV'
     }
     this.setData({
       bmsHasData: !!(s && s.hasData),
@@ -243,6 +315,7 @@ Page({
       cellRange: s && s.cellCount
         ? (s.minCellMv / 1000).toFixed(3) + ' ~ ' + (s.maxCellMv / 1000).toFixed(3) + ' V'
         : '',
+      cellSpread: cellSpread,
       cells: cells,
       cellBars: bars,
       bmsModel: state.model || '',
@@ -344,11 +417,19 @@ Page({
     this.stopLogWatchdog()
     const body = this.logBuf || ''
     const lines = body.split('\n').filter((l) => l.length)
+    // App 侧最后收到的遥测 —— 跟固件报的值对账用.
+    // 固件值在日志正文里 (我们回给 V35 的帧里那个车速字节), 这行是 App 看到的.
+    const lt = this.lastTelemetry
+    const appLine = lt
+      ? '# APP 车速 ' + lt.speed.toFixed(1) + ' km/h | 协议车速 ' + lt.protocolSpeed +
+        ' | 收到于 ' + new Date(lt.at).toLocaleString()
+      : '# APP 没有收到过遥测 (蓝牙通知链可能已经断了)'
     const header = [
       '# NIU-U1 485 总线日志',
       '# 固件 ' + (this.data.fwVersion || '未知') + '   导出 ' + new Date().toLocaleString(),
       '# 帧数 ' + lines.length,
       '# 格式: RX/TX <毫秒时间戳> <帧字节...>    RX = 总线上收到的, TX = 我们自己回的',
+      appLine,
       '',
     ].join('\n')
     const text = header + body
@@ -397,6 +478,19 @@ Page({
     const p = (n) => ('0' + n).slice(-2)
     return '' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) +
       '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds())
+  },
+
+  // 点某一串 → 报出这一串的电压和偏差 (标签太小看不清的时候用)
+  onCellTap(e) {
+    const idx = e.currentTarget.dataset.index
+    const bar = this.data.cellBars[idx]
+    if (!bar) return
+    const v = parseFloat(bar.v)
+    wx.showToast({
+      title: '第 ' + (idx + 1) + ' 串 ' + bar.v + 'V (偏差 ' + (bar.d > 0 ? '+' : '') + bar.d + 'mV)',
+      icon: 'none',
+      duration: 2000,
+    })
   },
 
   // ---------- 电池趋势图 ----------

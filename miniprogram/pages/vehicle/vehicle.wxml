@@ -27,6 +27,18 @@
     <text class="link-btn" bindtap="onDisconnect">断开</text>
   </view>
 
+  <!-- 数据停滞: 蓝牙通知链断了. 不提示的话, 速度会一直显示最后收到的那个值,
+       看起来像"车没动", 实际是 App 没数据了 -->
+  <view class="card stall" wx:if="{{stalled}}">
+    <view class="stall-title">数据停滞 —— 蓝牙通知断了</view>
+    <view class="tip">
+      车速/电池显示的是**最后收到**的那一帧, 不是实时值.
+      常见原因: 手机锁屏或小程序切到后台后通知被挂起, 回来没恢复.
+      点下面重连一下.
+    </view>
+    <button class="ghost" bindtap="onStallReconnect">重新连接</button>
+  </view>
+
   <!-- 车速: 第一眼要看到的东西 -->
   <view class="card">
     <view class="speed-wrap">
@@ -97,12 +109,17 @@
         <text class="label">单体电压</text>
         <text class="value">{{cellCount}} 串 {{cellRange}}</text>
       </view>
+      <view class="row" wx:if="{{cellSpread}}">
+        <text class="label">单体一致性</text>
+        <text class="value">{{cellSpread}} (柱高 = 相对最低串的偏差, 点柱子看详情)</text>
+      </view>
       <view class="row" wx:if="{{bmsModel}}">
         <text class="label">电池型号</text>
         <text class="value">{{bmsModel}}</text>
       </view>
       <view class="cell-bars" wx:if="{{cellBars.length}}">
-        <view class="cell-bar" wx:for="{{cellBars}}" wx:key="i">
+        <view class="cell-bar" wx:for="{{cellBars}}" wx:for-index="idx" wx:key="i"
+              bindtap="onCellTap" data-index="{{idx}}">
           <view class="cell-fill" style="height:{{item.h}}"></view>
           <text class="cell-text mono">{{item.v}}</text>
         </view>

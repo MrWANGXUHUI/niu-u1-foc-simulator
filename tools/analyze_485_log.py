@@ -24,6 +24,7 @@
     4) 有没有校验和错、长度不符、没见过的功能码 (总线上有干扰的证据)
 """
 
+import re
 import sys
 from collections import Counter
 
@@ -115,6 +116,7 @@ class Frame(object):
 def parse_log(path):
     frames = []
     header = []
+    app = {}          # App 侧最后收到的遥测 (写在文件头里)
     with open(path, 'r', encoding='utf-8', errors='replace') as f:
         for line in f:
             line = line.strip()
@@ -122,6 +124,17 @@ def parse_log(path):
                 continue
             if line.startswith('#'):
                 header.append(line)
+                # "# APP 车速 19.6 km/h | 协议车速 41 | 收到于 ..." → App 侧最后收到的值
+                if line.startswith('# APP'):
+                    m = re.search(r'车速\s*([\d.]+)\s*km/h', line)
+                    if m:
+                        app['speed'] = float(m.group(1))
+                    m = re.search(r'协议车速\s*(\d+)', line)
+                    if m:
+                        app['protocolSpeed'] = int(m.group(1))
+                    m = re.search(r'收到于\s*(.+)$', line)
+                    if m:
+                        app['at'] = m.group(1).strip()
                 continue
             parts = line.split()
             if len(parts) < 3:
@@ -138,7 +151,7 @@ def parse_log(path):
             except ValueError:
                 continue
             frames.append(Frame(direction, t, raw))
-    return header, frames
+    return header, frames, app
 
 
 def median(values):
@@ -154,7 +167,7 @@ def main():
         print(__doc__)
         sys.exit(1)
     path = sys.argv[1]
-    header, frames = parse_log(path)
+    header, frames, app = parse_log(path)
 
     print('=' * 64)
     for h in header:
@@ -225,6 +238,36 @@ def main():
             print('  超时的那些: %s ms' % ', '.join(str(x) for x in sorted(over)[:20]))
     else:
         print('没配对上查询和应答 —— 看下面的原始帧找原因.')
+
+    # ---- 车速: 固件解析出来的 vs App 侧收到的 ----
+    print()
+    print('=== 车速对账 ===')
+    speeds = []      # (t, 协议车速值)
+    for f in frames:
+        r = f.raw
+        if f.dir == 'TX' and r[1] == 0x20 and r[2] == 0xDF and r[4] == 0x82 and r[5] >= 12:
+            speeds.append((f.t, (r[6 + 9] - 0x33) & 0xFF))
+    if speeds:
+        vals = [s for _, s in speeds]
+        print('固件解析值: %d 帧, 协议车速 %d ~ %d (%.1f ~ %.1f km/h)'
+              % (len(speeds), min(vals), max(vals),
+                 min(vals) * 12 / 25, max(vals) * 12 / 25))
+        print('  最后一次 (t=%d ms): 协议车速 %d = %.1f km/h'
+              % (speeds[-1][0], speeds[-1][1], speeds[-1][1] * 12 / 25))
+        if app.get('speed') is not None:
+            fw = speeds[-1][1] * 12 / 25
+            diff = abs(app['speed'] - fw)
+            print('App 侧最后收到: %.1f km/h (协议车速 %s) —— %s'
+                  % (app['speed'], app.get('protocolSpeed', '?'),
+                     '跟固件一致 ✓' if diff < 1.0 else
+                     '**跟固件对不上 → App 侧是陈旧数据, 蓝牙通知链断了**'))
+            if diff >= 1.0:
+                print('  差 %.1f km/h. 固件这边明明在变, App 这边没更新 → '
+                      '不是测速的问题, 是通知没送到' % diff)
+        else:
+            print('App 侧: 日志头里没有 App 的速度 (没收到过遥测?)')
+    else:
+        print('日志里没有我们的状态应答帧 (TX), 没法对账')
 
     # ---- BMS ----
     # 地址对 31 CE 的帧有两种: V35 问 BMS 的请求 (功能码 0x02), 和 BMS 回 V35 的应答 (0x82).

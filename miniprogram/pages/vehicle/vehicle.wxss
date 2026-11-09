@@ -178,9 +178,28 @@
   border-radius: 4rpx 4rpx 0 0;
 }
 
+/* 单体电压标签.
+   字号必须小: 13 个 "3.618" 挤在 ~20pt 宽的柱子里, 字号大了排版宽度会
+   超出柱子 → 文字压到隔壁柱子上 → 看着像"电压和柱高对不上".
+   (transform: scale() 只缩渲染不缩排版, 救不了这个) */
 .cell-text {
-  font-size: 16rpx;
+  font-size: 12rpx;
   color: #6e7681;
   margin-top: 6rpx;
-  transform: scale(0.85);
+  white-space: nowrap;
+}
+
+/* 数据停滞的提示条 */
+.stall {
+  border: 1rpx solid #f85149;
+}
+
+.stall-title {
+  color: #f85149;
+  font-size: 28rpx;
+  margin-bottom: 8rpx;
+}
+
+.stall button {
+  margin: 16rpx 0 0;
 }
