@@ -20,6 +20,7 @@
 #include "ota_config.h"
 #include "ota_server.h"
 #include "ble_config.h"
+#include "hall_speed.h"
 #include "ble_telemetry.h"
 #include "bms_protocol.h"
 #include "bus_log.h"
@@ -58,6 +59,15 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_MIRROR, /* reset=*/ U8X8_PIN_NONE)
 // 两半, 毛刺占多数时 5 个样本的中位数就变成毛刺值 → 转速离谱 (实测 40 倍).
 #define HALL_MIN_INTERVAL_US  25000
 #define HALL_STOP_TIMEOUT_US  3000000   // 3s 没有新脉冲 → 认为停转, 车速归 0
+// 毛刺闸门的**上限** —— 修"车速冻在 19.6km/h"的关键.
+// 门槛一旦超过真脉冲可能的最小间隔, 就会开始丢**真**脉冲, 而且是自锁的:
+// 真脉冲被当毛刺丢掉 (丢掉时不更新时间戳) → 这一拍量到的间隔翻倍 →
+// 参照量跟着翻倍 → 门槛跟着涨 → 还是丢 → 越死越死.
+// 车速就永久锁在真实值的一半 (19.6 = 39.2/2), 除非停下来.
+// 上限的意义: 门槛永远 ≤ 80ms, 而 40km/h 的真间隔是 115ms → 真脉冲永远不会被误伤.
+// 80ms 也高于实测的振铃偏移上限 (60ms), 所以毛刺照样被挡.
+// 详见 src/hall_speed.h 的注释和 tools/test_hall_speed.cpp.
+#define HALL_GATE_MAX_US      80000
 // 停转阈值定 3s 是为了顾到低速骑行: 3s 转一圈 = 1.28m/3s = 1.5 km/h,
 // 也就是低于 1.5km/h 仪表本来就看不出差别, 归零没有损失; 而 2s 的话
 // 3~5km/h 的"蠕行"会整段显示 0 (间隔 1.5~2.3s 正好卡在阈值上).
@@ -176,19 +186,14 @@ static bool bms_seen = false;
 // 修法: 保留最近 HALL_HISTORY 个间隔取**中位数**. 中位数天生抗离群值 ——
 // 漏一个脉冲 (5 个里 1 个是 2 倍) 不影响中位数, 毛刺劈出的两个半间隔也一样.
 // 代价是车速变化有 2~3 拍的滞后 (17km/h 时约 0.8s), 换来的是稳.
-volatile uint32_t wheel_pulse_count = 0;
-volatile uint32_t last_pulse_us = 0;    // 最近一个脉冲的时刻
-volatile uint32_t prev_pulse_us = 0;    // 上一个脉冲的时刻 (两者之差 = 一圈时间)
-// 最近一次**可信**的间隔 (微秒). ISR 里的自适应毛刺闸门拿它当参照:
-// 比它短 40% 以上的脉冲一定是振铃, 不是真的转快了.
-// 主循环里算出可信间隔后更新 (volatile u32 写入在 ESP32 上是原子的, ISR 读安全).
-volatile uint32_t last_good_interval_us = 0;
-static uint32_t hall_hist_us[HALL_HISTORY] = {0};   // 最近几个间隔
-static uint8_t hall_hist_cnt = 0;
-static uint8_t hall_hist_idx = 0;
-static uint32_t hall_used_pulse_us = 0;   // 已经算过间隔的那个脉冲时刻
-static uint32_t hall_gap_reset = 0;       // 因停车太久重置过历史的次数 (诊断用)
-volatile uint32_t hall_glitch_count = 0;  // 被判为毛刺丢掉的快脉冲次数 (诊断用)
+// 测速的逻辑全在 src/hall_speed.h 里 (不依赖 Arduino, 可以在 PC 上做单元测试).
+// ⚠️ 不要在这里另写一份 —— 车速"冻在 19.6km/h" 就是这么查出来的:
+//    tools/test_hall_speed.cpp 复现了那个锁死, 改完记得跑它.
+static HallSpeed hallSpeed;
+
+// 给别处用的别名 (诊断 / 日志 / BLE 遥测)
+volatile uint32_t& wheel_pulse_count = hallSpeed.pulse_count;
+volatile uint32_t& hall_glitch_count = hallSpeed.glitch_count;
 
 // 协议速度值 — 线性刻度, 1 格 = 12/25 = 0.48 km/h
 // 依据:
@@ -205,34 +210,14 @@ uint16_t calcFOCSpeedFromKMH(float kmh) {
 
 // 轮速更新由 loop 周期驱动 (不是只在收到查询时), OLED 才能显示实时速度
 static unsigned long lastSpeedCalc = 0;
-static uint32_t last_interval_us = 0;   // 最近一次测到的脉冲间隔, 只用于日志
-static uint32_t hall_median_us = 0;     // 算转速实际用的那个间隔 (5 个样本的中位数), 只用于日志
+// 给别处用的别名 (诊断 / 日志 / BLE 遥测) —— 实际值都在 hallSpeed 里
+uint32_t& last_interval_us = hallSpeed.last_interval_us; // 最近一次测到的脉冲间隔, 只用于日志
+uint32_t& hall_median_us = hallSpeed.median_us;         // 算转速实际用的那个间隔 (中位数), 只用于日志
+uint32_t& hall_gap_reset = hallSpeed.gap_reset;         // 因停车太久重置过历史的次数 (诊断用)
 
-// 取最近若干个间隔的中位数 —— 抗漏脉冲和抗毛刺都靠它
-static uint32_t hallMedianInterval() {
-    if (hall_hist_cnt == 0) return 0;
-    uint32_t tmp[HALL_HISTORY];
-    for (uint8_t i = 0; i < hall_hist_cnt; i++) tmp[i] = hall_hist_us[i];
-    for (uint8_t i = 1; i < hall_hist_cnt; i++) {
-        uint32_t key = tmp[i];
-        int8_t j = (int8_t)i - 1;
-        while (j >= 0 && tmp[j] > key) { tmp[j + 1] = tmp[j]; j--; }
-        tmp[j + 1] = key;
-    }
-    return tmp[hall_hist_cnt / 2];
-}
-
-static void hallHistReset() {
-    hall_hist_cnt = 0;
-    hall_hist_idx = 0;
-}
-
-static void hallHistPush(uint32_t interval) {
-    hall_hist_us[hall_hist_idx] = interval;
-    hall_hist_idx = (uint8_t)((hall_hist_idx + 1) % HALL_HISTORY);
-    if (hall_hist_cnt < HALL_HISTORY) hall_hist_cnt++;
-}
-
+// 测速的间隔/毛刺/中位数逻辑全在 src/hall_speed.h 里 (不依赖 Arduino, 可在 PC 上单测).
+// 这里只留一个包装, 免得 .ino 里再抄一份 —— 抄一份的话, 单测测的就不是车上的代码了.
+// 详见 src/hall_speed.h 的注释 和 tools/test_hall_speed.cpp.
 void updateWheelSpeed() {
     unsigned long now = millis();
     unsigned long dt = now - lastSpeedCalc;
@@ -243,52 +228,10 @@ void updateWheelSpeed() {
     float rpm = 0.0f;
 
 #if USE_HALL_SPEED
-    uint32_t now_us  = micros();
-    uint32_t last_us = last_pulse_us;
-    uint32_t prev_us = prev_pulse_us;
-
-    // 有新脉冲 → 产生一个新的间隔, 推进历史
-    if (last_us != hall_used_pulse_us && prev_us != 0 && last_us > prev_us) {
-        hall_used_pulse_us = last_us;
-        uint32_t interval = last_us - prev_us;
-        if (interval >= HALL_STOP_TIMEOUT_US) {
-            // 间隔里含了停车时间 (停了很久又起步), 这一拍速度不可信:
-            // 历史全部作废, 车速按 0 起算, 让下一拍从干净状态重新收敛
-            hallHistReset();
-            hall_gap_reset++;
-        } else {
-            // 第二道闸门 (自适应). ISR 里那道已经按"最近可信周期"挡过一遍了,
-            // 这里再按"最近中位数"挡一次 —— 双保险, 免得毛刺混进历史.
-            // 比中位数短 40% 以上的间隔, 物理上不可能是真加速
-            // (一个间隔里速度要翻一倍, 踏板车做不到).
-            uint32_t med = hallMedianInterval();
-            uint32_t min_ok = HALL_MIN_INTERVAL_US;
-            if (med > 0) {
-                uint32_t adaptive = med * 3 / 5;
-                if (adaptive > min_ok) min_ok = adaptive;
-            }
-            if (interval < min_ok) {
-                hall_glitch_count++;
-            } else {
-                hallHistPush(interval);
-                last_interval_us = interval;
-                last_good_interval_us = interval;   // 给 ISR 里的自适应闸门当参照
-            }
-        }
-    }
-
-    // 停转判定: 从来没收到脉冲, 或者超过阈值没有新脉冲
-    bool stopped = (last_us == 0) || ((uint32_t)(now_us - last_us) >= HALL_STOP_TIMEOUT_US);
-
-    if (!stopped) {
-        uint32_t base = hallMedianInterval();
-        hall_median_us = base;   // 存一份给串口日志: 转速用的是它, 不是 last_interval_us
-        if (base > 0) {
-            float period_s = base / 1000000.0f;
-            rpm = 60.0f / (period_s * MAGNET_COUNT);
-            kmh = rpm * WHEEL_CIRCUMFERENCE_M * 60.0f / 1000.0f;
-        }
-    }
+    // 收新间隔 + 算车速. 逻辑在 hall_speed.h 里 (单测覆盖).
+    uint32_t now_us = micros();
+    hallSpeed.poll(now_us);
+    hallSpeed.speed(now_us, &kmh, &rpm);
 #else
     // 霍尔未启用: 直接给车速, 后面整条链路 (显示 + 协议值) 逻辑不变
     kmh = HARDCODE_SPEED_DM / 10.0f;
@@ -301,36 +244,10 @@ void updateWheelSpeed() {
 }
 
 void IRAM_ATTR wheelPulseISR() {
-    uint32_t now = micros();
-    // 1ms 消抖: 单磁钢在 30km/h 下脉冲间隔约 154ms, 1ms 阈值不会漏计真实脉冲
-    if (now - last_pulse_us > HALL_DEBOUNCE_US) {
-        // 物理上不可能的快脉冲 → 判为毛刺 (振铃/干扰), 丢掉.
-        //
-        // 两道闸门:
-        //   1) 绝对阈值 25ms —— 挡 6ms 那种 (车速离谱 40 倍就是它)
-        //   2) 自适应阈值 = 最近可信周期的 60% —— 挡 50~60ms 那种.
-        //      骑车时真间隔是几百毫秒 (40km/h → 115ms), 振铃出来的脉冲能穿過
-        //      绝对阈值, 混进历史 → 中位数被污染 → 车速跳来跳去, 匀速骑一会才收敛.
-        //      参照量用"最近一次可信的间隔" (主循环里更新), 加速时它自己会跟着变小.
-        //
-        // 关键: **丢掉时不更新 last_pulse_us / prev_pulse_us**.
-        // 更新了的话, 一个毛刺会把一个真间隔劈成"几毫秒 + 剩下的"两半:
-        // 短的进中位数历史, 长的又比真实值大 —— 车速两头都错.
-        // 不更新, 下一个真脉冲算出来的间隔才是准的.
-        uint32_t min_ok = HALL_MIN_INTERVAL_US;
-        uint32_t good = last_good_interval_us;
-        if (good > 0) {
-            uint32_t adaptive = good * 3 / 5;
-            if (adaptive > min_ok) min_ok = adaptive;
-        }
-        if (last_pulse_us != 0 && now - last_pulse_us < min_ok) {
-            hall_glitch_count++;
-            return;
-        }
-        prev_pulse_us = last_pulse_us;
-        last_pulse_us = now;
-        wheel_pulse_count++;
-    }
+    // 逻辑在 hall_speed.h 里 (单测覆盖): 1ms 消抖 + 自适应毛刺闸门.
+    // ⚠️ 丢毛刺时**不更新** last/prev 时间戳 —— 一个毛刺把一个真间隔劈成两半的话,
+    //    车速会一头高一头低. 详见 src/hall_speed.h 的第 1 条.
+    hallSpeed.onPulse(micros());
 }
 
 static uint8_t foc_response_data[14] = {0};
@@ -992,7 +909,7 @@ void loop() {
         .protocol_speed = (uint8_t)foc_status.foc_speed,
         .error = foc_status.error,
         .unlocked = foc_status.unlocked,
-        .glitch_count = (hall_glitch_count > 255) ? 255 : (uint8_t)hall_glitch_count,
+        .glitch_count = (uint8_t)((hall_glitch_count > 255) ? 255 : hall_glitch_count),
         .q_count = simulator.q_count,
         .a_count = simulator.a_count,
         .pulse_count = (uint16_t)wheel_pulse_count,
