@@ -43,6 +43,10 @@ static void checkNear(const std::string& name, float got, float want, float tol)
 // 1.5.2 的老逻辑 (照抄固件): 参照量 = 最近一次被接受的间隔, 门槛没有上限
 // ---------------------------------------------------------------------------
 struct OldHall {
+    // true = 1.5.1/1.5.2 (车上跑的): 参照量=最近一次, 门槛没上限,
+    //        而且**没有参照量时门槛只剩 25ms 下限** (起步那一下的坑)
+    // false = 1.5.3: 参照量=中位数, 门槛有上限, 没参照量时用保守的起步值
+    bool newLogic = false;
     uint32_t last_us = 0, prev_us = 0;
     uint32_t used_us = 0;
     uint32_t ref_us = 0;             // 最近一次可信间隔
@@ -52,6 +56,15 @@ struct OldHall {
 
     bool capped = false;            // 打开就是"新逻辑" (加上限)
     uint32_t gate() const {
+        if (newLogic) {
+            // 1.5.3: 没参照量 → 起步值 (保守); 有参照量 → 中位数×60%, 有上限
+            if (ref_us == 0) return HALL_GATE_STARTUP_US;
+            uint32_t m = HALL_MIN_INTERVAL_US;
+            uint32_t a = ref_us * 3 / 5;
+            if (a > m) m = a;
+            if (m > HALL_GATE_MAX_US) m = HALL_GATE_MAX_US;
+            return m;
+        }
         uint32_t min_ok = HALL_MIN_INTERVAL_US;
         if (ref_us > 0) {
             uint32_t adaptive = ref_us * 3 / 5;
@@ -107,7 +120,7 @@ struct OldHall {
 struct Sim {
     uint32_t t = 0;          // 仿真时钟 (us)
     uint32_t next_pulse = 0; // 下一次真脉冲的时刻
-    bool started = false;
+    bool moving = true;      // 轮子是否在转
 
     // 速度 → 脉冲间隔. 1 磁钢, 轮周长 1.28m.
     static uint32_t intervalFor(float kmh) {
@@ -116,18 +129,18 @@ struct Sim {
     }
 
     // 推进 dt 微秒, 期间按 speedAt(t) 生成脉冲.
-    // ring = 每个真脉冲后再补两个毛刺 (+3ms / +6ms), 模拟传感器振铃.
+    // ring = 每个真脉冲后再补三个毛刺 (+3/+6/+55ms), 模拟传感器振铃
+    //        (车上实测的偏移范围是 3~60ms, 见 NOTES.md).
     // 每 100ms 调一次 poll —— 固件主循环就是 100ms 一拍 (updateWheelSpeed).
     template <typename H>
     void advance(H& h, uint32_t dt, float (*speedAt)(uint32_t), bool ring,
                  std::function<bool(uint32_t)> skipPulse = nullptr) {
         uint32_t end = t + dt;
         uint32_t next_poll = t + 100000;
-        bool moving = true;
         while (t < end) {
             float kmh = speedAt(t);
             if (kmh < 0.5f) {
-                // 停转: 不产生脉冲 (车轮不动)
+                // 停转: 轮子不动, 没有脉冲. next_pulse 推远, 等重新起步.
                 moving = false;
                 next_pulse = t + 1000000;
             } else {
@@ -140,8 +153,11 @@ struct Sim {
                     if (!skipPulse || !skipPulse(next_pulse)) {
                         h.onPulse(next_pulse);
                         if (ring) {
+                            // 车上实测的振铃偏移 3~60ms. 30ms 那个最毒:
+                            // 1.28m/0.030s = 153km/h (用户说的"一百多")
                             h.onPulse(next_pulse + 3000);
                             h.onPulse(next_pulse + 6000);
+                            h.onPulse(next_pulse + 30000);
                         }
                     }
                     next_pulse += iv;
@@ -160,6 +176,7 @@ struct Sim {
 // 速度曲线
 static float speedSteady20(uint32_t) { return 20.0f; }
 static float speedSteady196(uint32_t) { return 19.6f; }
+static float speedStopped(uint32_t) { return 0.0f; }
 
 // 19.6 → 40 km/h, 8 秒线性加速, 然后保持
 static float speedRamp(uint32_t t) {
@@ -323,6 +340,42 @@ int main() {
         float iv40 = 1.28f * 3.6f / 40.0f * 1000000.0f;
         printf("    40km/h 真间隔 = %.0f us, 门槛上限 = %u us\n", iv40, (unsigned)HALL_GATE_MAX_US);
         check("40km/h 的真脉冲不会被上限挡住", iv40 > (float)HALL_GATE_MAX_US);
+    }
+
+    printf("\n=== 9. 刚起步 / 停车后再起步: 车速不能飙到 100+ ===\n");
+    {
+        // 复现: 参照量 = 0 时门槛只剩 25ms 下限 → 26~60ms 的振铃被当成真脉冲
+        // → 进了历史 → 中位数被污染 → 车速 = 1.28m/0.030s = 153km/h (十倍!)
+        // 老逻辑 (车上跑的 1.5.1/1.5.2) 必然飙, 新逻辑必须不飙.
+        auto startupPeak = [](auto& h, Sim& sim) {
+            float mx = 0;
+            uint32_t t0 = sim.t;
+            while (sim.t < t0 + 1000000) {
+                sim.advance(h, 20000, speedSteady196, true);
+                h.poll(sim.t);
+                float k = h.kmh(sim.t);
+                if (k > mx) mx = k;
+            }
+            return mx;
+        };
+
+        OldHall old;
+        Sim simOld;
+        simOld.advance(old, 4000000, speedStopped, false);   // 先停 4 秒
+        old.poll(simOld.t);
+        float oldPeak = startupPeak(old, simOld);
+        printf("    老逻辑 (1.5.1/1.5.2): 起步 1 秒内最高显示 %.1f km/h (真实 19.6)\n", oldPeak);
+        check("老逻辑确实会飙到 100+ (复现 bug)", oldPeak > 100.0f,
+              "如果没飙, 说明这个 bug 不存在, 下面的断言要重写");
+
+        HallSpeed hn;
+        Sim simNew;
+        simNew.advance(hn, 4000000, speedStopped, false);
+        hn.poll(simNew.t);
+        float newPeak = startupPeak(hn, simNew);
+        printf("    新逻辑:                起步 1 秒内最高显示 %.1f km/h (真实 19.6)\n", newPeak);
+        check("新逻辑起步不飙", newPeak < 30.0f, "起步时没有参照量, 门槛必须保守");
+        checkNear("起步 1 秒后车速是对的", hn.kmh(simNew.t), 19.6f, 2.0f);
     }
 
     printf("\n=== 8. 设计边界: 门槛上限对应的最高车速 (57.6km/h) ===\n");

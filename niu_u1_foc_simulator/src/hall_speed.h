@@ -81,6 +81,9 @@
 #ifndef HALL_GATE_MAX_US
 #define HALL_GATE_MAX_US 80000       // 门槛上限: 见上面第 2c 条 —— 修"冻在 19.6"的键
 #endif
+#ifndef HALL_GATE_STARTUP_US
+#define HALL_GATE_STARTUP_US 80000   // 起步门槛 (还没有参照量时用): 见上面 gateUs() 的说明
+#endif
 #ifndef HALL_STOP_TIMEOUT_US
 #define HALL_STOP_TIMEOUT_US 3000000 // 3s 没有新脉冲 → 停转, 车速归 0
 #endif
@@ -111,14 +114,32 @@ struct HallSpeed {
     volatile uint32_t ref_us = 0; // 闸门参照量: 历史间隔的中位数 (主循环算好发布给 ISR)
 
     // 闸门门槛: clamp(参照量 × 60%, 绝对下限, 上限). 见上面第 2 条.
+    //
+    // ⚠️ **没有参照量时 (ref == 0) 用的是"起步专用值" (保守), 不是下限 (宽松)** ——
+    //    这是 2026-11-10 修的"刚骑车就飙到 100+km/h":
+    //      刚开机 / 刚停车 (历史被清空) → 参照量 = 0 → 门槛只剩 25ms 下限
+    //      → 车上振铃是"离真沿 3~60ms", 26~60ms 的振铃被当成真脉冲收下
+    //      → 那个间隔进了历史 → 中位数被污染 → 车速 = 1.28m/0.030s = 153km/h
+    //    而且污染是**自持**的: 参照量被拉到 30ms → 门槛只剩 25ms → 更多振铃进来.
+    //    "骑一会就正常"是因为历史里真间隔 eventually 把坏样本挤出去 (只有 5 个样本,
+    //    所以收敛得很快) —— 但刚起步那几秒显示的是错的.
+    //
+    //    起步值 80ms 的依据 (两条约束夹出来的):
+    //      > 振铃偏移上限 60ms  → 26~60ms 的振铃照样被挡 ✓
+    //      < 最低真实间隔 115ms (40km/h) → 真脉冲不会被误伤 ✓
+    //    上限 HALL_GATE_MAX_US (80ms) 是**另一回事**: 它防的是"门槛涨到超过真间隔"
+    //    导致的自锁 (车速冻在真实值的一半). 两者数值相同纯属巧合, 所以分成两个常量.
     HALL_SPEED_IRAM uint32_t gateUs() const {
-        uint32_t min_ok = HALL_MIN_INTERVAL_US;
         uint32_t ref = ref_us;
-        if (ref > 0) {
+        uint32_t min_ok;
+        if (ref == 0) {
+            min_ok = HALL_GATE_STARTUP_US;    // 不知道周期 → 宁可严, 不能让振铃进来
+        } else {
+            min_ok = HALL_MIN_INTERVAL_US;
             uint32_t adaptive = ref * 3 / 5;
             if (adaptive > min_ok) min_ok = adaptive;
+            if (min_ok > HALL_GATE_MAX_US) min_ok = HALL_GATE_MAX_US;
         }
-        if (min_ok > HALL_GATE_MAX_US) min_ok = HALL_GATE_MAX_US;
         return min_ok;
     }
 
