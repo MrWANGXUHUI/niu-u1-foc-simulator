@@ -143,8 +143,11 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_MIRROR, /* reset=*/ U8X8_PIN_NONE)
 
 // ============ FOC状态 ============
 struct FOCStatus {
-    uint16_t voltage;
-    int16_t current;
+    // 注: 这里原来有 voltage/current 两个字段, 初值写死 480/0 从来没人改过.
+    // 它们只是往 BLE 遥测里塞的两个假数 (旧小程序"车速下面那排"显示的
+    // 48.0V / 0.0A 就是它, 跟电池区里 BMS 解析出来的真值重复还打架).
+    // 现在那排已经删了, 遥测里的电压/电流改直接用 BMS 的真值,
+    // 所以这两个字段删掉 —— 留着的话以后肯定有人误用.
     uint16_t foc_speed;
     uint16_t wheel_rpm;
     uint16_t wheel_speed_dm;   // 车速 × 10 (十分位整数, 保留小数显示精度)
@@ -154,7 +157,7 @@ struct FOCStatus {
 } __attribute__((packed));
 
 static FOCStatus foc_status = {
-    .voltage = 480, .current = 0, .foc_speed = 0,
+    .foc_speed = 0,
     .wheel_rpm = 0, .wheel_speed_dm = 0,
     .error = 0x00, .unlocked = 0, .unlock_timestamp = 0
 };
@@ -910,8 +913,14 @@ void loop() {
     bleTelemetry.publish({
         .speed_dm = foc_status.wheel_speed_dm,
         .rpm = foc_status.wheel_rpm,
-        .voltage = foc_status.voltage,
-        .current = foc_status.current,
+        // 电压/电流取 **BMS 的真值**, 不是 foc_status 里那两个写死的占位值
+        // (初值 480/0 从来没人改过 —— 旧小程序"车速下面那排"显示的
+        //  48.0V / 0.0A 就是它, 跟电池区里 BMS 解析出来的真值重复还打架).
+        // 单位对齐: 遥测要 0.1V / 0.1A; BMS 给的是 0.1V / 整数 A.
+        // 帧格式没变 (还是 20 字节, 同样的偏移), 所以老版本小程序照样能解析,
+        // 只是这两个数从"假的"变成"真的".
+        .voltage = bms_info.voltage_dv,
+        .current = (int16_t)(bms_info.current * 10),
         .protocol_speed = (uint8_t)foc_status.foc_speed,
         .error = foc_status.error,
         .unlocked = foc_status.unlocked,

@@ -212,7 +212,26 @@ await new Promise((r) => setTimeout(r, 20))
 check('导出日志: 头里有 App 侧速度', headerText.indexOf('# APP 车速 19.6 km/h') >= 0, true)
 check('导出日志: 头里有协议车速', headerText.indexOf('协议车速 41') >= 0, true)
 
-// ---- 7) 停滞检测: 很久没收到遥测要报出来 (而不是默默显示旧值) ----
+// ---- 7) 车速下面那排不再重复显示电压/电流 (电池区有 BMS 的真值) ----
+// 遥测帧里的电压/电流曾经是固件写死的占位值 (480/0),
+// 跟电池区 BMS 解析出来的真值重复还打架 (48.0V vs 45.2V).
+// 现在那排只留 转速 + 锁定状态.
+{
+  const fs = require('fs')
+  const wxml = fs.readFileSync(
+    path.join(__dirname, '..', 'miniprogram', 'pages', 'vehicle', 'vehicle.wxml'), 'utf8')
+  const statRow = wxml.slice(wxml.indexOf('class="stat-row"'), wxml.indexOf('class="stat-row"') + 900)
+  check('车速下面那排: 没有电压', statRow.indexOf('电压') < 0, true)
+  check('车速下面那排: 没有电流', statRow.indexOf('电流') < 0, true)
+  check('车速下面那排: 转速还在', statRow.indexOf('转速') >= 0, true)
+  // 电池区仍然得有 BMS 的真值 (不能一起删掉)
+  check('电池区: 还有 BMS 的总电压/电流', wxml.indexOf('总电压 / 电流') >= 0, true)
+  // 页面 data 里那两个死字段也不该留
+  check('页面 data: 没有死字段 voltage', page.data.voltage === undefined, true)
+  check('页面 data: 没有死字段 current', page.data.current === undefined, true)
+}
+
+// ---- 8) 停滞检测: 很久没收到遥测要报出来 (而不是默默显示旧值) ----
 page.setData({ stalled: false, connected: true })
 page.lastTelemetryAt = Date.now() - 9000
 page.checkStall()

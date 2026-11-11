@@ -18,8 +18,6 @@ Page({
     // 车速
     speed: '0.0',
     rpm: '0',
-    voltage: '0.0',
-    current: '0.0',
     protocolSpeed: '0',
     errorCode: '',
     unlockedText: '已锁定',
@@ -212,8 +210,6 @@ Page({
     this.setData({
       speed: t.speed.toFixed(1),
       rpm: String(t.rpm),
-      voltage: t.voltage.toFixed(1),
-      current: t.current.toFixed(1),
       protocolSpeed: String(t.protocolSpeed),
       errorCode: t.error ? '0x' + t.error.toString(16).toUpperCase().padStart(2, '0') : '',
       unlockedText: t.unlocked ? '已解锁' : '已锁定',

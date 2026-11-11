@@ -52,16 +52,6 @@
         <text class="stat-unit">RPM</text>
       </view>
       <view class="stat">
-        <text class="stat-label">电压</text>
-        <text class="stat-value">{{voltage}}</text>
-        <text class="stat-unit">V</text>
-      </view>
-      <view class="stat">
-        <text class="stat-label">电流</text>
-        <text class="stat-value">{{current}}</text>
-        <text class="stat-unit">A</text>
-      </view>
-      <view class="stat">
         <text class="stat-label">{{unlockedText}}</text>
         <text class="stat-value" wx:if="{{errorCode}}" style="color:#f85149">{{errorCode}}</text>
         <text class="stat-unit" wx:else>—</text>
