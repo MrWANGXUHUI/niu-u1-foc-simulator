@@ -48,36 +48,10 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_MIRROR, /* reset=*/ U8X8_PIN_NONE)
 // 仅在 USE_HALL_SPEED = 0 时生效; 17 km/h 对应协议值 35, 仪表显示约 16.8 km/h
 #define HARDCODE_SPEED_DM 170
 
-// 霍尔测速参数
-#define HALL_DEBOUNCE_US      1000      // ISR 消抖: 1ms, 远小于最慢的真实脉冲间隔
-// 物理上不可能的最小脉冲间隔 —— 毛刺闸门.
-// 1 磁钢 + 1.28m 轮子: 30km/h 时真实间隔 154ms, 60km/h 时 77ms.
-// 25ms 对应 ~92km/h, 也就是说真实脉冲永远不可能落在这个区间里 ——
-// 落在里面的只能是传感器振铃 / 线受干扰产生的毛刺.
-// 为什么需要它: 车上 485 和电机控制器是强干扰源, 传感器开漏输出用内部 45k 上拉
-// 走长线, 边沿的振铃能通过 1ms 消抖. 一个毛刺会把一个真间隔劈成"几毫秒 + 剩下的"
-// 两半, 毛刺占多数时 5 个样本的中位数就变成毛刺值 → 转速离谱 (实测 40 倍).
-#define HALL_MIN_INTERVAL_US  25000
-#define HALL_STOP_TIMEOUT_US  3000000   // 3s 没有新脉冲 → 认为停转, 车速归 0
-// 起步门槛 (刚开机 / 刚停车, 还没有参照量时用) —— 修"刚骑车就飙到 100+km/h"的关键.
-// 参照量 = 0 时如果用下限 (25ms), 26~60ms 的振铃会被当成真脉冲收下 →
-// 那个间隔进历史 → 中位数被污染 → 车速 = 1.28m/0.030s = 153km/h (十倍).
-// 而且污染是自持的: 参照量被拉到 30ms → 门槛只剩 25ms → 更多振铃进来.
-// 80ms 的依据: > 振铃偏移上限 (60ms), 又 < 最低真实间隔 (40km/h → 115ms).
-#define HALL_GATE_STARTUP_US  80000
-// 毛刺闸门的**上限** —— 修"车速冻在 19.6km/h"的关键.
-// 门槛一旦超过真脉冲可能的最小间隔, 就会开始丢**真**脉冲, 而且是自锁的:
-// 真脉冲被当毛刺丢掉 (丢掉时不更新时间戳) → 这一拍量到的间隔翻倍 →
-// 参照量跟着翻倍 → 门槛跟着涨 → 还是丢 → 越死越死.
-// 车速就永久锁在真实值的一半 (19.6 = 39.2/2), 除非停下来.
-// 上限的意义: 门槛永远 ≤ 80ms, 而 40km/h 的真间隔是 115ms → 真脉冲永远不会被误伤.
-// 80ms 也高于实测的振铃偏移上限 (60ms), 所以毛刺照样被挡.
-// 详见 src/hall_speed.h 的注释和 tools/test_hall_speed.cpp.
-#define HALL_GATE_MAX_US      80000
-// 停转阈值定 3s 是为了顾到低速骑行: 3s 转一圈 = 1.28m/3s = 1.5 km/h,
-// 也就是低于 1.5km/h 仪表本来就看不出差别, 归零没有损失; 而 2s 的话
-// 3~5km/h 的"蠕行"会整段显示 0 (间隔 1.5~2.3s 正好卡在阈值上).
-#define HALL_HISTORY          5         // 取中位数的样本数 (奇数)
+// 霍尔测速的参数都在 src/hall_speed.h 里 (不依赖 Arduino, 可在 PC 上做单元测试).
+// ⚠️ 别在这里再定义一遍 —— 之前两份定义不一致过, 头文件里的内联函数和这里的代码
+//    会用不同的值, 查起来非常费劲. 要改参数改头文件, 改完跑 tools/test_hall_speed.cpp.
+#include "hall_speed.h"
 
 // ============ 联调测试开关 ============
 // 485 每秒主动发一帧测试数据, 用来确认 ESP32 确实在往总线上发.
@@ -999,15 +973,38 @@ void loop() {
 
     if (millis() - last_debug > 3000) {
 #if USE_HALL_SPEED
-        Serial.printf("[状态] %s | 轮速:%dRPM | %.1fkm/h | 间隔:%lums(中位%lums) | 脉冲:%lu | 毛刺:%lu | 停车重置:%lu\n",
+        Serial.printf("[状态] %s | 轮速:%dRPM | %.1fkm/h | 间隔:%lums(中位%lums) | 脉冲:%lu | 物理:%lu | 毛刺:%lu | 停车重置:%lu\n",
             foc_status.unlocked ? "已解锁" : "已锁定",
             foc_status.wheel_rpm,
             foc_status.wheel_speed_dm / 10.0,
             (unsigned long)last_interval_us,
             (unsigned long)hall_median_us,
             (unsigned long)wheel_pulse_count,
+            (unsigned long)hallSpeed.phys_count,
             (unsigned long)hall_glitch_count,
             (unsigned long)hall_gap_reset);
+        // 霍尔原始间隔 —— 只在"车停着, 线上却有脉冲"时打.
+        // 2026-11-11 真车日志: 车停着充电却报了 12 秒的协议值 127 (=61km/h),
+        // 假车速的周期 ~71ms, 跟 485 总线的帧率 (14.1 帧/秒) 几乎一样 ——
+        // 怀疑噪声就是我们自己的总线活动耦合进霍尔线.
+        // 下面这行能把噪声的周期结构直接打出来: 71ms 上下 = 总线, 25~60ms
+        // 随机的 = 充电器开关噪声. 拿它来定"要不要加硬件滤波".
+        {
+            static uint32_t prev_phys = 0;
+            uint32_t pc = hallSpeed.phys_count;
+            bool got_pulse = (pc != prev_phys);
+            prev_phys = pc;
+            if (got_pulse && foc_status.wheel_speed_dm == 0) {
+                uint32_t gaps[HALL_RAW_GAP_N];
+                hallSpeed.rawGaps(gaps, HALL_RAW_GAP_N);
+                Serial.printf("[霍尔] 停着却有 %lu 个物理脉冲, 最近间隔(us): ",
+                              (unsigned long)pc);
+                for (uint8_t i = 0; i < HALL_RAW_GAP_N; i++) {
+                    Serial.printf("%lu ", (unsigned long)gaps[i]);
+                }
+                Serial.printf("\n");
+            }
+        }
 #else
         Serial.printf("[状态] %s | 轮速:%dRPM | %.1fkm/h\n",
             foc_status.unlocked ? "已解锁" : "已锁定",
