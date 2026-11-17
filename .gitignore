@@ -13,3 +13,6 @@ package-lock.json
 miniprogram/firmware/firmware.js
 miniprogram-preview-qrcode.png
 __pycache__/
+
+# 跟项目无关的本地软件安装包
+clash-for-linux-install/
